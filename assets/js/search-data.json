@@ -1,0 +1,1703 @@
+{"0": {
+    "doc": "Agent I/O",
+    "title": "Agent I/O — NeuroDiscover (Quorum)",
+    "content": "Owner: Alia / team agents. Literature section by Ayelet. Schema: Database schema . Every agent reads prior tables, writes its own output, and appends to agent_outputs. ",
+    "url": "/developer-reference/agent-io/#agent-io--neurodiscover-quorum",
+    
+    "relUrl": "/developer-reference/agent-io/#agent-io--neurodiscover-quorum"
+  },"1": {
+    "doc": "Agent I/O",
+    "title": "Standard trace row",
+    "content": "All agents insert into agent_outputs: . INSERT INTO agent_outputs (run_id, agent_name, step_order, summary, payload) VALUES (?, ?, ?, ?, ?); . | Field | Type | Required | Notes | . | run_id | TEXT | yes | Same id for one pipeline run (share across agents) | . | agent_name | TEXT | yes | Exact names below | . | step_order | INTEGER | yes | 1, 2, … within this agent’s steps | . | summary | TEXT | yes | Human-readable one-liner for dashboard | . | payload | TEXT (JSON) | optional | Machine-readable stats | . Rule: Downstream agents never read raw BioMCP JSON or external API blobs. Only distilled DB columns. ",
+    "url": "/developer-reference/agent-io/#standard-trace-row",
+    
+    "relUrl": "/developer-reference/agent-io/#standard-trace-row"
+  },"2": {
+    "doc": "Agent I/O",
+    "title": "Agent 1 — Literature Synthesis Agent (Ayelet)",
+    "content": "Reads: external PubMed + ClinicalTrials.gov via BioMCP; subgroups.name for auto-linking Writes: evidence, subgroup_evidence (auto-link), scan_state, agent_outputs . CLI (Person 3 data layer) . python3 cli.py pull --disease \"your condition\" --max 150 # stage 1: published (default) python3 cli.py pull --max 50 --include-preprints 20 # + bioRxiv preprints python3 cli.py pull --max 50 --with-fulltext # OA: PMC → EPMC → Unpaywall sections python3 cli.py enrich-with-fulltext --limit 50 # backfill sections on existing rows python3 cli.py pull --query \"GBA GCase lysosomal\" --gene GBA python3 cli.py pull-grants --limit 30 python3 cli.py scan --max 5 . See Literature pull for MCP env vars (PUBMED_MCP_COMMAND, BIORXIV_MCP_COMMAND, UNPAYWALL_EMAIL). EXTRACT_BACKEND=nebius|ollama|none selects LLM for core discovery fields on literature (5 fields). Trials still use the fuller prompt (study_type, sample_size). INSERT evidence . Required on live pull: source_type, source_id (real PMID/DOI/NCT only — no invented ids). Recommended populated fields: . source_type, source_id, title, year, publication_year, venue, abstract, subgroup, mechanism, treatment, key_result, evidence_snippet, access_type, access_status, full_text_url, is_preprint, methods_text, results_text, discussion_text, url, doi . Literature rows often omit study_type / sample_size; trials populate them during Agent 1 extraction. access_type / access_status values . | access_type | access_status | Meaning | . | published_oa | open | OA full text available | . | published_paywalled | restricted | Abstract/metadata only | . | preprint | abstract_only | bioRxiv preprint | . | error | error | Lookup failed | . | unknown | unknown | Unclassified | . Auto-link subgroup_evidence . After insert, if evidence.subgroup matches subgroups.name exactly: . INSERT OR IGNORE INTO subgroup_evidence (subgroup_id, evidence_id) VALUES (?, ?); . Example payload . { \"new_evidence\": 3, \"skipped_duplicates\": 7, \"touched_existing\": 7, \"rejected_no_id\": 1, \"since_year\": 2024, \"incremental\": true } . CLI . python3 cli.py pull --since 2022 --max 10 # full backfill python3 cli.py scan --max 5 # incremental (skips LLM for known ids) python3 cli.py demo # offline; no API calls . ",
+    "url": "/developer-reference/agent-io/#agent-1--literature-synthesis-agent-ayelet",
+    
+    "relUrl": "/developer-reference/agent-io/#agent-1--literature-synthesis-agent-ayelet"
+  },"3": {
+    "doc": "Agent I/O",
+    "title": "Agent 2 — Patient Subgroup Agent (Alia)",
+    "content": "Reads: . SELECT evidence_id, subgroup, mechanism, treatment, key_result, study_type, sample_size FROM evidence WHERE subgroup IS NOT NULL; . Writes: subgroups (INSERT new names or UPDATE features), agent_outputs . Do not duplicate evidence rows. Tag subgroups in evidence; refine definitions in subgroups. ",
+    "url": "/developer-reference/agent-io/#agent-2--patient-subgroup-agent-alia",
+    
+    "relUrl": "/developer-reference/agent-io/#agent-2--patient-subgroup-agent-alia"
+  },"4": {
+    "doc": "Agent I/O",
+    "title": "Agent 3 — Treatment Connection Agent (Alia)",
+    "content": "Reads: . SELECT s.subgroup_id, s.name, e.mechanism, e.treatment, e.evidence_id FROM evidence e JOIN subgroups s ON s.name = e.subgroup WHERE e.mechanism IS NOT NULL AND e.treatment IS NOT NULL; . Writes: . INSERT INTO treatment_connections (subgroup_id, mechanism, treatment) VALUES (?,?,?); INSERT OR IGNORE INTO connection_evidence (connection_id, evidence_id) VALUES (?,?); . Plus agent_outputs. ",
+    "url": "/developer-reference/agent-io/#agent-3--treatment-connection-agent-alia",
+    
+    "relUrl": "/developer-reference/agent-io/#agent-3--treatment-connection-agent-alia"
+  },"5": {
+    "doc": "Agent I/O",
+    "title": "Agent 4 — Evidence Scoring / Skeptic (Alia)",
+    "content": "Reads: in-memory connections from Agent 3 plus evidence rows matching each connection’s subgroup, mechanism, and treatment. Uses per-connection evidence_count (continuous scaling) and source_type on those rows — not per-row study_type / sample_size. Reference SQL (for inspecting linked evidence after persistence): . SELECT tc.connection_id, e.source_type, e.study_type, e.sample_size, e.access_status, e.key_result FROM treatment_connections tc JOIN connection_evidence ce ON ce.connection_id = tc.connection_id JOIN evidence e ON e.evidence_id = ce.evidence_id; . Writes: . UPDATE treatment_connections SET evidence_strength = ? WHERE connection_id = ?; . The orchestrator calls _scale_score() (×10) before UPDATE, so the DB column holds 0–100. Plus agent_outputs. ",
+    "url": "/developer-reference/agent-io/#agent-4--evidence-scoring--skeptic-alia",
+    
+    "relUrl": "/developer-reference/agent-io/#agent-4--evidence-scoring--skeptic-alia"
+  },"6": {
+    "doc": "Agent I/O",
+    "title": "Agent 5 — Commercial Discovery (Alia / Amy)",
+    "content": "Reads: in-memory scored_connections from Agent 4 External: none in current code — heuristic scoring only. NIH grants are ingested via pull-grants / full mode; grant rows infer subgroup fields from title keywords so they can affect connection counts. Writes: . UPDATE treatment_connections SET commercial_potential = ? WHERE connection_id = ?; . The orchestrator scales ×10 before UPDATE. Plus agent_outputs. ",
+    "url": "/developer-reference/agent-io/#agent-5--commercial-discovery-alia--amy",
+    
+    "relUrl": "/developer-reference/agent-io/#agent-5--commercial-discovery-alia--amy"
+  },"7": {
+    "doc": "Agent I/O",
+    "title": "Agent 6 — Conclusion Update (Amy)",
+    "content": "Reads: scored treatment_connections joined to subgroups . SELECT tc.connection_id, s.name AS subgroup, tc.treatment, tc.evidence_strength, tc.commercial_potential FROM treatment_connections tc JOIN subgroups s ON s.subgroup_id = tc.subgroup_id WHERE tc.evidence_strength IS NOT NULL AND tc.commercial_potential IS NOT NULL; . Writes: . INSERT INTO recommendations (run_id, connection_id, subgroup, treatment, confidence, tier, rationale) VALUES (?, ?, ?, ?, ?, ?, ?); . Where confidence = evidence_strength * 0.55 + commercial_potential * 0.45 and: . | Tier | Condition | . | Prioritize | confidence ≥ 80 | . | Monitor | 65 ≤ confidence &lt; 80 | . | Reject | confidence &lt; 65 | . Plus agent_outputs. CUA package — grant proposal (separate I/O path, Amy He) . The standalone cua/ Conclusion Update Agent reads the same blackboard SELECT-only (via cua/src/cua/nih/adapters/neurodiscover.py) but does not apply the evidence_strength IS NOT NULL AND commercial_potential IS NOT NULL filter — it reads all connections and maps NULL grades to minimal. It writes no SQL; output is local JSON/HTML under cua/outputs/. Entrypoint: python -m cua.nih.run_db --db &lt;url|path&gt;. See Conclusion Update workflow. ",
+    "url": "/developer-reference/agent-io/#agent-6--conclusion-update-amy",
+    
+    "relUrl": "/developer-reference/agent-io/#agent-6--conclusion-update-amy"
+  },"8": {
+    "doc": "Agent I/O",
+    "title": "Shared run_id convention",
+    "content": "Pass the same run_id through all six agents in one discovery run so the dashboard can filter: . SELECT * FROM agent_outputs WHERE run_id = ? ORDER BY output_id; . ",
+    "url": "/developer-reference/agent-io/#shared-run_id-convention",
+    
+    "relUrl": "/developer-reference/agent-io/#shared-run_id-convention"
+  },"9": {
+    "doc": "Agent I/O",
+    "title": "Subgroup name vocabulary (prefer exact match)",
+    "content": "Demo seed uses illustrative names such as: . | GBA-mutation PD | LRRK2 PD | Alpha-synuclein-high PD | Inflammation-high PD | Rapid motor progressors | . Literature agent extraction prompt prefers consistent subgroup labels when the evidence supports them. ",
+    "url": "/developer-reference/agent-io/#subgroup-name-vocabulary-prefer-exact-match",
+    
+    "relUrl": "/developer-reference/agent-io/#subgroup-name-vocabulary-prefer-exact-match"
+  },"10": {
+    "doc": "Agent I/O",
+    "title": "Agent I/O",
+    "content": " ",
+    "url": "/developer-reference/agent-io/",
+    
+    "relUrl": "/developer-reference/agent-io/"
+  },"11": {
+    "doc": "API endpoints",
+    "title": "Person 2 — API endpoints",
+    "content": "Backend: neurodiscover/api_server.py (FastAPI, port 5000). The dashboard reads these routes when browser Supabase keys are unset. Full JSON shapes: Backend queries. UI guide: Dashboard API. ",
+    "url": "/developer-reference/api-endpoints/#person-2--api-endpoints",
+    
+    "relUrl": "/developer-reference/api-endpoints/#person-2--api-endpoints"
+  },"12": {
+    "doc": "API endpoints",
+    "title": "Safety",
+    "content": ". | Never run cli.py build when .env points at the team Supabase DB (truncates all tables). | POST /api/run-discovery runs the orchestrator and writes scores, recommendations, and agent_outputs. | All other routes are read-only. | . ",
+    "url": "/developer-reference/api-endpoints/#safety",
+    
+    "relUrl": "/developer-reference/api-endpoints/#safety"
+  },"13": {
+    "doc": "API endpoints",
+    "title": "Routes",
+    "content": "| Method | Path | Notes | . | GET | /health | Status + database label | . | GET | /api/discover/parkinsons | Subgroups + treatment connections (legacy path; indication-agnostic) | . | GET | /api/recommendations | Ranked list; optional ?run_id= | . | GET | /api/agents | Agent trace; optional ?run_id= | . | GET | /api/stats | Evidence counts + lastScanAt | . | GET | /api/evidence | Paginated evidence (offset, limit) | . | GET | /api/runs | Recent runs (limit) | . | GET | /api/run-stats | Per-run processed vs DB totals; requires run_id | . | GET | /api/run-discovery/status | Poll async pipeline job; requires run_id | . | GET | /api/synthetic-cohort | Ephemeral profiles; requires run_id | . | GET | /api/cua/demo | Static bundled grant-proposal summary (graded6; Step 3 tab; not run-scoped) | . | GET | /cua-demo/graded6.html | Pre-rendered grant-proposal HTML report (served by API static mount) | . | POST | /api/run-discovery | Pipeline run. Default (wait: false): { \"run_id\", \"status\": \"running\", \"accepted\": true }. With wait: true: full payload (recommendations, agent_outputs, runStats, synthetic_cohort) | . ",
+    "url": "/developer-reference/api-endpoints/#routes",
+    
+    "relUrl": "/developer-reference/api-endpoints/#routes"
+  },"14": {
+    "doc": "API endpoints",
+    "title": "Quick verify",
+    "content": "cd neurodiscover make dashboard # local demo + UI — see frontend/quickstart.md . Or manually: . python3 cli.py build # local only — skip on team Supabase python3 cli.py validate python3 api_server.py curl -s http://127.0.0.1:5000/health curl -s http://127.0.0.1:5000/api/stats curl -s 'http://127.0.0.1:5000/api/run-stats?run_id=YOUR_RUN_ID' . ",
+    "url": "/developer-reference/api-endpoints/#quick-verify",
+    
+    "relUrl": "/developer-reference/api-endpoints/#quick-verify"
+  },"15": {
+    "doc": "API endpoints",
+    "title": "API endpoints",
+    "content": " ",
+    "url": "/developer-reference/api-endpoints/",
+    
+    "relUrl": "/developer-reference/api-endpoints/"
+  },"16": {
+    "doc": "Backend queries",
+    "title": "Backend queries",
+    "content": "Database file: neurodiscover/neurodiscover.db (SQLite, inside neurodiscover/ package dir — see paths.py) Full SQL: queries.sql Schema: Database schema . ",
+    "url": "/developer-reference/backend-queries/",
+    
+    "relUrl": "/developer-reference/backend-queries/"
+  },"17": {
+    "doc": "Backend queries",
+    "title": "Connection (Python example)",
+    "content": "import sqlite3 conn = sqlite3.connect(\"neurodiscover/neurodiscover.db\") conn.row_factory = sqlite3.Row . Implemented server: neurodiscover/api_server.py (FastAPI). See API endpoints. No MongoDB required. If you mirror to Atlas, use field names from the MongoDB mapping table in Database schema. Collection: evidence, not papers. ",
+    "url": "/developer-reference/backend-queries/#connection-python-example",
+    
+    "relUrl": "/developer-reference/backend-queries/#connection-python-example"
+  },"18": {
+    "doc": "Backend queries",
+    "title": "GET /api/discover/parkinsons",
+    "content": "Legacy route name — returns subgroups and connections from the current database regardless of configured indication. Returns disease overview, subgroups, and treatment connections. JSON shape . { \"disease\": \"Parkinson's Disease\", \"subgroups\": [ { \"subgroupId\": 1, \"name\": \"GBA-mutation PD\", \"definingFeatures\": \"...\", \"evidenceCount\": 2 } ], \"treatmentConnections\": [ { \"connectionId\": 1, \"subgroup\": \"GBA-mutation PD\", \"mechanism\": \"lysosomal dysfunction\", \"treatment\": \"GCase activation\", \"evidenceStrength\": null, \"commercialPotential\": null, \"confidence\": null } ], \"recommendation\": {} } . SQL — subgroups . SELECT s.subgroup_id, s.name, s.defining_features, s.notes, COUNT(DISTINCT se.evidence_id) AS evidence_count FROM subgroups s LEFT JOIN subgroup_evidence se ON se.subgroup_id = s.subgroup_id GROUP BY s.subgroup_id; . SQL — treatment connections . SELECT tc.connection_id, s.name AS subgroup, tc.mechanism, tc.treatment, tc.evidence_strength, tc.commercial_potential FROM treatment_connections tc JOIN subgroups s ON s.subgroup_id = tc.subgroup_id; . ",
+    "url": "/developer-reference/backend-queries/#get-apidiscoverparkinsons",
+    
+    "relUrl": "/developer-reference/backend-queries/#get-apidiscoverparkinsons"
+  },"19": {
+    "doc": "Backend queries",
+    "title": "GET /api/agents",
+    "content": "Agent trace for the dashboard pipeline cards. JSON shape . { \"runId\": \"a1b2c3d4\", \"steps\": [ { \"agentName\": \"Literature Synthesis Agent\", \"stepOrder\": 1, \"summary\": \"Pulled 10 raw sources via BioMCP for configured disease query.\", \"payload\": { \"since_year\": 2022, \"incremental\": false }, \"createdAt\": \"2026-06-01 12:00:00\" } ] } . SQL — latest run trace . SELECT run_id, agent_name, step_order, summary, payload, created_at FROM agent_outputs WHERE run_id = (SELECT run_id FROM agent_outputs ORDER BY output_id DESC LIMIT 1) ORDER BY output_id; . ",
+    "url": "/developer-reference/backend-queries/#get-apiagents",
+    
+    "relUrl": "/developer-reference/backend-queries/#get-apiagents"
+  },"20": {
+    "doc": "Backend queries",
+    "title": "GET /api/recommendations",
+    "content": "Ranked recommendations from Agent 6. JSON shape . { \"recommendations\": [ { \"subgroup\": \"GBA-mutation PD\", \"treatment\": \"GCase activation\", \"mechanism\": \"lysosomal dysfunction\", \"confidence\": 82.5, \"tier\": \"Prioritize\", \"rationale\": \"...\" } ] } . SQL . SELECT r.subgroup, r.treatment, r.confidence, r.tier, r.rationale, tc.mechanism, tc.evidence_strength, tc.commercial_potential FROM recommendations r LEFT JOIN treatment_connections tc ON tc.connection_id = r.connection_id ORDER BY r.confidence DESC; . ",
+    "url": "/developer-reference/backend-queries/#get-apirecommendations",
+    
+    "relUrl": "/developer-reference/backend-queries/#get-apirecommendations"
+  },"21": {
+    "doc": "Backend queries",
+    "title": "POST /api/run-discovery",
+    "content": "Trigger the agent pipeline (orchestrator.py). Request: . { \"mode\": \"full\", \"run_id\": \"f799fbe8\", \"query\": \"GBA GCase\", \"max_papers\": 150, \"disease\": \"Parkinson's\", \"pull_grants\": true, \"wait\": false } . | mode: demo | scan | full | agents-only | . Optional run_id — UI generates an 8-char id before POST so the run status strip and agent_outputs share one trace from the start. Full mode passes it to literature_agent.run(). agents-only — skip literature pull; run agents 2–6 on existing evidence. Used automatically by make dashboard when SUPABASE_DATABASE_URL is set. Optional max_papers cap (API minimum 10; orchestrator accepts 0 = all rows). wait — default false. When false, the API starts the pipeline in a background thread and returns immediately. When true, blocks until completion and returns the full payload below. Async response (wait: false, default): . { \"run_id\": \"a1b2c3d4\", \"status\": \"running\", \"accepted\": true } . Poll GET /api/run-discovery/status?run_id= until status is complete, partial, or failed. Then fetch recommendations, agents, and run-stats separately. Synchronous response (wait: true): . { \"run_id\": \"a1b2c3d4\", \"recommendations\": [{ \"subgroup\": \"...\", \"treatment\": \"...\", \"mechanism\": \"...\", \"confidence\": 67.5, \"tier\": \"Monitor\", \"rationale\": \"...\" }], \"agent_outputs\": [{ \"agentName\": \"Literature Synthesis Agent\", \"stepOrder\": 1, \"summary\": \"...\", \"createdAt\": \"...\" }], \"steps\": [], \"synthetic_cohort\": [{ \"patient_id\": \"Patient Cluster A\", \"subgroup\": \"...\", \"confidence\": 82.5, \"is_synthetic\": true }], \"runStats\": { \"mode\": \"demo\", \"maxPapersRequested\": 10, \"processed\": { \"literature\": 5, \"trial\": 4, \"grant\": 0, \"total\": 9 }, \"databaseTotals\": { \"literature\": 228, \"trial\": 39, \"grant\": 40, \"total\": 307 }, \"added\": { \"literature\": 0, \"trial\": 0, \"grant\": 0, \"total\": 0 } } } . steps is an alias of agent_outputs. GET /api/run-discovery/status . Poll background pipeline state. Requires run_id. { \"run_id\": \"a1b2c3d4\", \"status\": \"running\", \"statusDetail\": \"Pipeline in progress · 3/6 agents complete\", \"agentsDone\": 3, \"recommendations\": 2 } . | status: running | complete | partial | failed. On failure, response includes error. | . ",
+    "url": "/developer-reference/backend-queries/#post-apirun-discovery",
+    
+    "relUrl": "/developer-reference/backend-queries/#post-apirun-discovery"
+  },"22": {
+    "doc": "Backend queries",
+    "title": "Dashboard read helpers (API-only mode — no browser Supabase keys)",
+    "content": "Used when the frontend does not set SUPABASE_URL / SUPABASE_ANON_KEY. GET /api/stats . { \"literature\": 228, \"trial\": 39, \"grant\": 40, \"subgroups\": 5, \"connections\": 5, \"totalEvidence\": 307, \"lastScanAt\": \"2026-06-02T14:32:00\", \"lastRunId\": \"a1b2c3d4\", \"database\": \"sqlite\", \"supabaseConfigured\": false } . GET /api/run-stats?run_id=a1b2c3d4 . Same runStats object shape as in POST /api/run-discovery (for revisiting a past run in the UI). GET /api/evidence?offset=0&amp;limit=15 . { \"items\": [{ \"sourceType\": \"literature\", \"title\": \"...\", \"accessStatus\": \"open\" }], \"total\": 307, \"offset\": 0, \"limit\": 15 } . GET /api/runs?limit=5 . { \"runs\": [{ \"runId\": \"abc123\", \"steps\": 6, \"startedAt\": \"...\", \"mode\": \"demo\", \"recommendations\": 5, \"syntheticProfiles\": 5, \"status\": \"Complete\", \"evidenceNote\": \"+29 stored · 4 papers · 25 trials\" }] } . GET /api/agents?run_id=abc123 . Same shape as GET /api/agents below; optional run_id query param. GET /api/synthetic-cohort?run_id=abc123 . Ephemeral Synthea-style demo profiles (not stored in DB). { \"run_id\": \"abc123\", \"synthetic_cohort\": [ { \"patient_id\": \"Patient Cluster A\", \"patient_letter\": \"A\", \"subgroup\": \"GBA-mutation PD\", \"subgroup_color\": \"#2563eb\", \"synthetic_age\": 68, \"synthetic_sex\": \"M\", \"key_feature\": \"GBA1 variant carriers\", \"top_opportunity\": \"GCase activation\", \"mechanism\": \"lysosomal dysfunction\", \"confidence\": 82.5, \"is_synthetic\": true, \"phi_free\": true } ] } . POST /api/run-discovery returns the same synthetic_cohort array plus agent_outputs (alias of steps). ",
+    "url": "/developer-reference/backend-queries/#dashboard-read-helpers-api-only-mode--no-browser-supabase-keys",
+    
+    "relUrl": "/developer-reference/backend-queries/#dashboard-read-helpers-api-only-mode--no-browser-supabase-keys"
+  },"23": {
+    "doc": "Backend queries",
+    "title": "Quick verify",
+    "content": "Local (no Supabase keys): . cd neurodiscover python3 cli.py build # local neurodiscover.db only python3 cli.py validate python3 api_server.py # port 5000 curl -s http://127.0.0.1:5000/api/stats curl -s http://127.0.0.1:5000/api/recommendations curl -s -X POST http://127.0.0.1:5000/api/run-discovery \\ -H 'Content-Type: application/json' -d '{\"mode\":\"demo\",\"max_papers\":10}' . Team Supabase: set SUPABASE_DATABASE_URL in .env, do not run build, then validate, api_server.py, and the same curl lines. See neurodiscover/frontend/quickstart.md. ",
+    "url": "/developer-reference/backend-queries/#quick-verify",
+    
+    "relUrl": "/developer-reference/backend-queries/#quick-verify"
+  },"24": {
+    "doc": "Backend queries",
+    "title": "Evidence detail (optional endpoint)",
+    "content": "For citation panels on the dashboard: . SELECT source_type, source_id, title, evidence_snippet, url, access_status FROM evidence WHERE evidence_id = ?; . access_status values: open, abstract_only, restricted — show a badge in the UI. ",
+    "url": "/developer-reference/backend-queries/#evidence-detail-optional-endpoint",
+    
+    "relUrl": "/developer-reference/backend-queries/#evidence-detail-optional-endpoint"
+  },"25": {
+    "doc": "Commercial Discovery",
+    "title": "Agent 5 — Commercial Discovery",
+    "content": "Module: neurodiscover/agents/commercial_discovery_agent.py Owner: Alia Merchant / Amy He Step order: 5 (orchestrator logs trace) . ",
+    "url": "/workflow/commercial-discovery/#agent-5--commercial-discovery",
+    
+    "relUrl": "/workflow/commercial-discovery/#agent-5--commercial-discovery"
+  },"26": {
+    "doc": "Commercial Discovery",
+    "title": "Role",
+    "content": "Estimate commercial potential (0–10) for each scored connection using in-memory heuristics — subgroup keywords, mechanism class, treatment presence, and evidence count (continuous, not a single ≥5 threshold). Current code: no Tavily or live web search. NIH grants are ingested via pull-grants / full mode (pull_grants=true); grant rows infer subgroup/mechanism/treatment from title keywords so they can enter agents 2–6. ",
+    "url": "/workflow/commercial-discovery/#role",
+    
+    "relUrl": "/workflow/commercial-discovery/#role"
+  },"27": {
+    "doc": "Commercial Discovery",
+    "title": "Reads",
+    "content": "In-memory output from Agent 4 (scored_connections). ",
+    "url": "/workflow/commercial-discovery/#reads",
+    
+    "relUrl": "/workflow/commercial-discovery/#reads"
+  },"28": {
+    "doc": "Commercial Discovery",
+    "title": "Writes (via orchestrator)",
+    "content": "UPDATE treatment_connections SET commercial_potential = ? WHERE connection_id = ?; . The orchestrator calls _scale_score() (×10) before UPDATE, so the DB column holds 0–100. | Stage | Minimum | Maximum | . | Agent output (commercial_potential heuristic) | 0 | 10 | . | Stored on treatment_connections | 0 | 100 | . ",
+    "url": "/workflow/commercial-discovery/#writes-via-orchestrator",
+    
+    "relUrl": "/workflow/commercial-discovery/#writes-via-orchestrator"
+  },"29": {
+    "doc": "Commercial Discovery",
+    "title": "Heuristic signals (code)",
+    "content": "| Signal | Effect | . | Volume | 5.5 + min(2.5, evidence_count × 0.12) | . | Subgroup mentions gba or lrrk2 | +0.9 | . | Mechanism mentions alpha / synuclein | +0.6 | . | Mechanism mentions lysosomal / kinase | +0.7 | . | Non-empty treatment | +0.6 | . Capped at 10.0 before orchestrator scaling (×10 → stored 0–100). ",
+    "url": "/workflow/commercial-discovery/#heuristic-signals-code",
+    
+    "relUrl": "/workflow/commercial-discovery/#heuristic-signals-code"
+  },"30": {
+    "doc": "Commercial Discovery",
+    "title": "Example (agent output, pre-scale)",
+    "content": "| Connection | commercial_potential | . | GBA subgroup → GCase activation | 7.8 | . | LRRK2 subgroup → LRRK2 inhibition | 8.1 | . Agent 6 combines scaled DB scores into recommendations.confidence. ",
+    "url": "/workflow/commercial-discovery/#example-agent-output-pre-scale",
+    
+    "relUrl": "/workflow/commercial-discovery/#example-agent-output-pre-scale"
+  },"31": {
+    "doc": "Commercial Discovery",
+    "title": "Commercial Discovery",
+    "content": " ",
+    "url": "/workflow/commercial-discovery/",
+    
+    "relUrl": "/workflow/commercial-discovery/"
+  },"32": {
+    "doc": "Conclusion Update",
+    "title": "Agent 6 — Conclusion Update",
+    "content": "Agent 6 has two implementations. They share the name and read the same upstream blackboard, but they serve different purposes and do not replace each other. |   | Dashboard pipeline | CUA package (cua/) | . | Purpose | Rank treatments for the dashboard | Write a full NIH R01 grant proposal from the evidence | . | Module | neurodiscover/orchestrator.py | cua/src/cua/ (standalone package) | . | Owner | Amy He (orchestrator) | Amy He (CUA) | . | Runs when | Every demo / scan / full / agents-only pipeline run | Manually — not part of the dashboard pipeline | . | Uses LLMs | No | Yes — Blueprint, Synthesizer, Critic, Reviser, etc. | . | Writes DB | recommendations + agent_outputs | Nothing — read-only consumer | . | Output | Ranked Prioritize / Monitor / Reject cards | Local files: proposal, trace, audit, ingestion (+ HTML report) | . The dashboard pipeline run uses the orchestrator path for ranked recommendations. CUA is the grant-proposal path for Agent 6 — bundled on Step 3 — Grant Proposal (graded6) and runnable live via CLI after the pipeline has populated evidence. ",
+    "url": "/workflow/conclusion-update/#agent-6--conclusion-update",
+    
+    "relUrl": "/workflow/conclusion-update/#agent-6--conclusion-update"
+  },"33": {
+    "doc": "Conclusion Update",
+    "title": "Dashboard pipeline (what the demo runs)",
+    "content": "Module: logic in neurodiscover/orchestrator.py Step order: 6 (in-process after agents 2–5) . Role . Combine evidence and commercial scores into ranked recommendations with Prioritize / Monitor / Reject tiers and a short rationale string. Reads . SELECT tc.connection_id, s.name AS subgroup, tc.treatment, tc.evidence_strength, tc.commercial_potential FROM treatment_connections tc JOIN subgroups s ON s.subgroup_id = tc.subgroup_id WHERE tc.evidence_strength IS NOT NULL AND tc.commercial_potential IS NOT NULL; . Writes . INSERT INTO recommendations (run_id, connection_id, subgroup, treatment, confidence, tier, rationale) VALUES (?, ?, ?, ?, ?, ?, ?); . Plus final agent_outputs row. Confidence formula . confidence = evidence_strength × 0.55 + commercial_potential × 0.45 . | Field | Minimum | Maximum | . | Agent 4/5 heuristics (pre-scale) | 0 | 10 | . | evidence_strength / commercial_potential (stored) | 0 | 100 | . | confidence (API + dashboard) | 0 | 100 | . Tier rules . | Tier | Condition | . | Prioritize | confidence ≥ 80 | . | Monitor | 65 ≤ confidence &lt; 80 | . | Reject | confidence &lt; 65 | . Example recommendation . { \"subgroup\": \"GBA-mutation PD\", \"treatment\": \"GCase activation\", \"mechanism\": \"lysosomal dysfunction\", \"confidence\": 82.5, \"tier\": \"Prioritize\", \"rationale\": \"GBA-mutation PD → GCase activation via lysosomal dysfunction. Confidence 82.5 (Prioritize).\" } . Downstream . | Dashboard Ranked treatments panel reads recommendations | Ideal candidate profiles (Patient Cluster A–E) generated from top recommendations — not persisted | . See Output examples for full JSON shapes. ",
+    "url": "/workflow/conclusion-update/#dashboard-pipeline-what-the-demo-runs",
+    
+    "relUrl": "/workflow/conclusion-update/#dashboard-pipeline-what-the-demo-runs"
+  },"34": {
+    "doc": "Conclusion Update",
+    "title": "CUA package — NIH grant proposal",
+    "content": "Package: cua/ at repo root Entrypoint: python -m cua.nih.run_db Design docs: cua/files/conclusion_update_agent_design.md, cua/README.md . CUA (Conclusion Update Agent) reads the NeuroDiscover blackboard and produces a written NIH R01 grant proposal with citation grounding, multi-round self-correction, and a full audit trail. The dashboard Step 3 — Grant Proposal tab shows the bundled graded6 output; live runs use the CLI below. CUA does not write to recommendations or run inside the Steps 1–2 pipeline (make dashboard / cli.py demo). What it does (step by step) . | Reads the shared DB read-only — evidence, subgroups, treatment_connections, connection_evidence | Ingestion — clusters by similar key_finding, ranks by topic relevance, and selects verified papers (top_k, e.g. 60) for drafters; the full corpus (e.g. 400) stays available for citation checks (inv-1). See Dashboard — Corpus vs verified papers. | Plans — Blueprint Planner sets NIH rubric obligations (F1/F2/F3) | Writes — Synthesizer drafts the argument (best-of-N), Aim Architect structures specific aims | Grounds — hard gate: every citation must exist in the corpus | Critiques — blind Critic scores against NIH criteria; flags overclaims vs evidence grades | Revises — Reviser fixes problems; F2 Rigor Booster (when enabled) injects papers the writer did not see | Outputs local files (not DB rows): . | &lt;run&gt;.proposal.json — grant text | &lt;run&gt;.trace.jsonl — per-subagent calls | &lt;run&gt;.audit.json — citation integrity, critic scores, overclaim check | &lt;run&gt;.ingestion.json — corpus rank-and-bound report | &lt;run&gt;.content.json + HTML visual report when --capture-content is set (cua/outputs/graded6.html ships pre-rendered for the dashboard) | . | . Evidence grades come from Agent 4 logic replayed into a local read-only SQLite snapshot — CUA never writes to the shared Supabase/SQLite blackboard. Critic score scale (F1 / F2 / F3) . The Internal Critic scores F1, F2, and F3 on an integer 1–9 scale (minimum 1, maximum 9) — shown in Tab 3 as n/9: . | Range | Meaning | . | 1–4 | Needs revision | . | 5–6 | Meets typical revise-loop threshold | . | 7–9 | Strong | . The revise loop typically stops when F1 ≥ 5 and F2 ≥ 5. Bundled graded6 final scores: F1 = 7, F2 = 5, F3 = 6. See Dashboard — Critic score scale. How to run . cd cua pip install -e . # Offline demo — deterministic surrogates, no API, no DB: python -m cua.nih.run # Live against team Supabase (or local neurodiscover.db): export ANTHROPIC_API_KEY=... export CUA_LIVE=1 python -m cua.nih.run_db --db \"$SUPABASE_DATABASE_URL\" --run-id demo-1 --capture-content . Set SUPABASE_DATABASE_URL from Supabase setup. Use a local path instead of the URL for SQLite. Integration posture . | CUA is a read-only downstream consumer of the same data the dashboard pipeline writes | PR #12 added neurodiscover/frontend/supabase_dashboard.html for viewing Supabase evidence/connections/recommendations — that page does not invoke CUA | Full CUA architecture, contracts, and honest limits: cua/README.md | Dashboard: Step 3 Grant Proposal tab inlines the static bundled graded6 report — The proposal expanded at top, Grant pipeline in its own collapsed block, then collapsed Pipeline trace &amp; audit; Jump to → Proposal · Grant pipeline · Supporting details — not tied to Step 1/2 run_id (see Dashboard — Step 3 report structure) | . ",
+    "url": "/workflow/conclusion-update/#cua-package--nih-grant-proposal",
+    
+    "relUrl": "/workflow/conclusion-update/#cua-package--nih-grant-proposal"
+  },"35": {
+    "doc": "Conclusion Update",
+    "title": "Conclusion Update",
+    "content": " ",
+    "url": "/workflow/conclusion-update/",
+    
+    "relUrl": "/workflow/conclusion-update/"
+  },"36": {
+    "doc": "Dashboard API",
+    "title": "NeuroDiscover Dashboard",
+    "content": "Single-page UI: neurodiscover/frontend/index.html (vanilla HTML/CSS/JS, no build step). ",
+    "url": "/developer-reference/dashboard-api/#neurodiscover-dashboard",
+    
+    "relUrl": "/developer-reference/dashboard-api/#neurodiscover-dashboard"
+  },"37": {
+    "doc": "Dashboard API",
+    "title": "Quick start",
+    "content": "Requires Python 3.10, 3.11, or 3.12. git clone https://github.com/kahinimehta/Quorum.git cd Quorum/neurodiscover pip install -r requirements.txt # or: conda env create -f environment.yml &amp;&amp; conda activate neurodiscover make dashboard . Opens the URL printed by the launcher (default UI http://127.0.0.1:8080 with ?api=http://127.0.0.1:5000; always includes ?api=). Use --no-browser to copy the Open: line. Press Ctrl+C to stop API + UI. With team Supabase (SUPABASE_DATABASE_URL in .env), the same command skips build and runs agents-only before serving so connections and recommendations are populated on first load. Details: ../../neurodiscover/frontend/quickstart.md. ",
+    "url": "/developer-reference/dashboard-api/#quick-start",
+    
+    "relUrl": "/developer-reference/dashboard-api/#quick-start"
+  },"38": {
+    "doc": "Dashboard API",
+    "title": "Data flow",
+    "content": "Default (no browser Supabase keys): UI → FastAPI (api_server.py :5000) → SQLite or team Postgres (SUPABASE_DATABASE_URL on the server only). Optional: set SUPABASE_URL + SUPABASE_ANON_KEY in the page or localStorage for direct read-only Supabase queries (parallel to the API). flowchart LR Browser[Browser] API[api_server.py :5000] DB[(SQLite or Postgres)] Orch[orchestrator.py] Agents[Agents 1-6] Browser --&gt;|GET /api/*| API Browser --&gt;|POST /api/run-discovery| API API --&gt; DB API --&gt; Orch Orch --&gt; Agents Agents --&gt; DB . ",
+    "url": "/developer-reference/dashboard-api/#data-flow",
+    
+    "relUrl": "/developer-reference/dashboard-api/#data-flow"
+  },"39": {
+    "doc": "Dashboard API",
+    "title": "UI layout",
+    "content": "| Area | Content | . | Header | DB status badge and optional run id chip | . | Step 2 KPI strip | Per-type counts above Discovery Results; subtitles switch to this run after a pipeline completes | . | Run status strip | Ready / Running / Complete / Partial / Failed | . | Step 1 | Configure &amp; run — pipeline mode (Rescore / Demo / Incremental / Full), disease, max papers, extraction; single run button. Mode FAQ: Inputs — pipeline modes | . | Step 2 | Pipeline complete badge beside title; three output panels — hypotheses sets height; ideal candidate profiles and ranked outputs match it and scroll when longer; discovery pipeline diagram; Audit &amp; provenance collapsed (agent trace + evidence table inside) | . | Step 3 | Static grant proposal — bundled graded6 demo inlined (not run-scoped); The proposal expanded first; Grant pipeline in separate collapsed block; audit prose in collapsed Pipeline trace &amp; audit; Jump to → Proposal · Grant pipeline · Supporting details; toolbar x/y obligations satisfied | . Step 3 — report structure . | Jump to | Layout | Content | . | Proposal | Always visible (first in report) | NIH R01 proposal | . | Grant pipeline | Collapsed block | Interactive agent-flow diagram | . | Supporting details | One collapsed group | Data loop · contract · dropped args · revise rounds · booster · A/B outcomes · raw trace · audit · ingestion | . Timestamps display in US Eastern (America/New_York, labeled EST or EDT). ",
+    "url": "/developer-reference/dashboard-api/#ui-layout",
+    
+    "relUrl": "/developer-reference/dashboard-api/#ui-layout"
+  },"40": {
+    "doc": "Dashboard API",
+    "title": "API reads (no browser keys)",
+    "content": "| Panel | Route | . | Step 2 KPI strip (database view) | GET /api/stats | . | Subgroups / connections | GET /api/discover/parkinsons (legacy path; indication-agnostic) | . | Recommendations | GET /api/recommendations?run_id= | . | Recent runs | GET /api/runs | . | Per-run counts | GET /api/run-stats?run_id= | . | Agent trace | GET /api/agents?run_id= | . | Run completion | GET /api/run-discovery/status?run_id= | . | Evidence table | GET /api/evidence?offset=&amp;limit= | . | Synthetic patients | GET /api/synthetic-cohort?run_id= or included in run response | . | Grant proposal (Step 3) | GET /api/cua/demo · report GET /cua-demo/graded6.html | . ",
+    "url": "/developer-reference/dashboard-api/#api-reads-no-browser-keys",
+    
+    "relUrl": "/developer-reference/dashboard-api/#api-reads-no-browser-keys"
+  },"41": {
+    "doc": "Dashboard API",
+    "title": "Pipeline run",
+    "content": "| Action | Endpoint | . | Demo / scan / full / agents-only | POST /api/run-discovery | . Body (example): { \"mode\": \"demo\", \"run_id\": \"abc12345\", \"max_papers\": 10, \"disease\": \"Parkinson's\", \"query\": null, \"with_fulltext\": false, \"pull_grants\": true } . Response includes: run_id, recommendations, agent_outputs (alias steps), synthetic_cohort, runStats (processed vs database totals). Orchestrator modes (all run literature in-process with the client run_id for live run-status updates): . | demo — offline seeded evidence; trace: Demo mode: using N of M… | scan — incremental pull; trace: Starting incremental scan… → Incremental scan complete: stored N new… | full — live PubMed + trials (+ optional preprints, full text, grants); trace: Starting full live pull… → Full live pull complete: stored N new… | agents-only — no literature pull; trace: Agents-only: using N of M… | . GET /api/runs returns mode (API slug) and modeLabel (UI string). evidenceNote is mode-specific — incremental runs include incremental and skip counts; full runs list papers/trials stored. runStats includes modeLabel alongside mode. ",
+    "url": "/developer-reference/dashboard-api/#pipeline-run",
+    
+    "relUrl": "/developer-reference/dashboard-api/#pipeline-run"
+  },"42": {
+    "doc": "Dashboard API",
+    "title": "Scoring (agents 4–5)",
+    "content": "Evidence and commercial scores scale with per-connection evidence count (see Evidence Scoring and Commercial Discovery). | Field | Min | Max | Notes | . | evidence_strength | 0 | 100 | Agent 4 heuristic capped at 10, then ×10 | . | commercial_potential | 0 | 100 | Agent 5 heuristic capped at 10, then ×10 | . | recommendations.confidence | 0 | 100 | Weighted blend below | . ",
+    "url": "/developer-reference/dashboard-api/#scoring-agents-45",
+    
+    "relUrl": "/developer-reference/dashboard-api/#scoring-agents-45"
+  },"43": {
+    "doc": "Dashboard API",
+    "title": "Ideal candidate profiles",
+    "content": "generate_synthetic_cohort(run_id) builds Patient Cluster A–E from recommendations + subgroups. Not stored in the DB. Every profile is labeled synthetic / no PHI. ",
+    "url": "/developer-reference/dashboard-api/#ideal-candidate-profiles",
+    
+    "relUrl": "/developer-reference/dashboard-api/#ideal-candidate-profiles"
+  },"44": {
+    "doc": "Dashboard API",
+    "title": "Confidence (discovery pipeline)",
+    "content": "confidence = evidence_strength × 0.55 + commercial_potential × 0.45 . | Tier | Rule | . | Prioritize | ≥ 80 | . | Monitor | 65–79 | . | Reject | &lt; 65 | . ",
+    "url": "/developer-reference/dashboard-api/#confidence-discovery-pipeline",
+    
+    "relUrl": "/developer-reference/dashboard-api/#confidence-discovery-pipeline"
+  },"45": {
+    "doc": "Dashboard API",
+    "title": "Ingestion KPIs (Step 3 — grant proposal)",
+    "content": "GET /api/cua/demo includes ingestion from the bundled audit artifacts: . | Field | Meaning | . | corpus_n | Full evidence rows ingested for the run (citation gate referent) | . | top_k | Verified papers count — diversified top-K representatives the Synthesizer/revisers read | . audit.obligations_satisfied / audit.obligations_total drive the report toolbar (17/21 obligations satisfied in graded6). See Dashboard — Corpus vs verified papers. ",
+    "url": "/developer-reference/dashboard-api/#ingestion-kpis-step-3--grant-proposal",
+    
+    "relUrl": "/developer-reference/dashboard-api/#ingestion-kpis-step-3--grant-proposal"
+  },"46": {
+    "doc": "Dashboard API",
+    "title": "Critic scores (Step 3 — grant proposal)",
+    "content": "Static CUA demo KPIs expose F1, F2, and F3 from audit.calibration.internal_scores (GET /api/cua/demo). Each dimension is an integer 1–9 (minimum 1, maximum 9): . | Range | Meaning | . | 1–4 | Needs revision | . | 5–6 | Meets typical revise-loop threshold | . | 7–9 | Strong | . Revise loop typically requires F1 ≥ 5 and F2 ≥ 5. See Dashboard — Critic score scale. ",
+    "url": "/developer-reference/dashboard-api/#critic-scores-step-3--grant-proposal",
+    
+    "relUrl": "/developer-reference/dashboard-api/#critic-scores-step-3--grant-proposal"
+  },"47": {
+    "doc": "Dashboard API",
+    "title": "Related docs",
+    "content": ". | JSON shapes: Backend queries | Endpoint list: API endpoints | Agent I/O: Agent I/O | Mockup notes (archived): ../../neurodiscover/frontend/mockup-v2.md | . ",
+    "url": "/developer-reference/dashboard-api/#related-docs",
+    
+    "relUrl": "/developer-reference/dashboard-api/#related-docs"
+  },"48": {
+    "doc": "Dashboard API",
+    "title": "Dashboard API",
+    "content": " ",
+    "url": "/developer-reference/dashboard-api/",
+    
+    "relUrl": "/developer-reference/dashboard-api/"
+  },"49": {
+    "doc": "Dashboard",
+    "title": "Dashboard",
+    "content": "Single-page UI at neurodiscover/frontend/index.html — vanilla HTML/CSS/JS, no build step. ",
+    "url": "/dashboard/",
+    
+    "relUrl": "/dashboard/"
+  },"50": {
+    "doc": "Dashboard",
+    "title": "Quick start",
+    "content": "Python 3.10, 3.11, or 3.12 · macOS, Linux, Windows · make dashboard = python3 cli.py dashboard . pip: . git clone https://github.com/kahinimehta/Quorum.git cd Quorum/neurodiscover python3 --version # must be 3.10.x – 3.12.x pip install -r requirements.txt cp .env.example .env make dashboard # use `python3 cli.py dashboard` for Windows . conda (empty environment): . git clone https://github.com/kahinimehta/Quorum.git cd Quorum/neurodiscover conda env create -f environment.yml conda activate neurodiscover cp .env.example .env make dashboard # use `python3 cli.py dashboard` for Windows . Opens the URL printed by the launcher (default UI http://127.0.0.1:8080 with ?api=http://127.0.0.1:5000). Use --no-browser to skip auto-open and copy the Open: line. Press Ctrl+C to stop API + UI. The launcher will: . | Install dependencies (unless --skip-install) | Build local neurodiscover.db if missing (skipped when SUPABASE_DATABASE_URL is set) | Run one pipeline pass before serving (unless --skip-pipeline): . | Local SQLite: Demo sample with max_papers=10 | Team Supabase: Rescore DB (agents-only) on all existing evidence | . | Start FastAPI (default 5000, auto-fallback if busy) and static UI on 8080 — launcher always opens UI with ?api=http://127.0.0.1:{resolved_api_port} | . Platform notes . | Platform | Tip | . | Windows | make often unavailable — use python cli.py dashboard | . | Windows | ./dashboard requires Git Bash or WSL | . | Linux / WSL / SSH / headless | --no-browser then open the Open: URL from launcher output (includes ?api=) | . | macOS | Port 5000 sometimes taken by AirPlay Receiver — --port-api 5001 --port-ui 8081 or disable AirPlay | . | Any OS | Python must be 3.10–3.12. Re-run pip install -r requirements.txt or conda env update -f environment.yml --prune if imports fail | . | Conda | conda activate neurodiscover before starting the dashboard | . Useful flags . python3 cli.py dashboard --no-browser # do not auto-open browser python3 cli.py dashboard --skip-install # skip pip install (deps already installed) python3 cli.py dashboard --skip-pipeline # start servers only python3 cli.py dashboard --fresh # rebuild local SQLite DB python3 cli.py dashboard --port-api 5001 --port-ui 8081 . See also Debugging if the dashboard fails to start. ",
+    "url": "/dashboard/#quick-start",
+    
+    "relUrl": "/dashboard/#quick-start"
+  },"51": {
+    "doc": "Dashboard",
+    "title": "Team Supabase",
+    "content": "Set SUPABASE_DATABASE_URL in .env (Session pooler URI). Then: . make dashboard . Same command as local — the launcher detects Postgres, skips build, and runs agents-only on the full evidence corpus so connections, scores, and recommendations populate before the UI opens. Never run cli.py build on the team DB. Optional browser keys (SUPABASE_URL + SUPABASE_ANON_KEY) enable direct read-only Supabase queries from the UI; the default path is still FastAPI → Postgres. ",
+    "url": "/dashboard/#team-supabase",
+    
+    "relUrl": "/dashboard/#team-supabase"
+  },"52": {
+    "doc": "Dashboard",
+    "title": "Data flow",
+    "content": "Default (no browser Supabase keys): UI → FastAPI (api_server.py :5000) → SQLite or team Postgres. Optional: set SUPABASE_URL + SUPABASE_ANON_KEY in the page or localStorage for direct read-only Supabase queries. flowchart LR Browser[Browser] API[api_server.py :5000] DB[(SQLite or Postgres)] Orch[orchestrator.py] Agents[Agents 1-6] Browser --&gt;|GET /api/*| API Browser --&gt;|POST /api/run-discovery| API API --&gt; DB API --&gt; Orch Orch --&gt; Agents Agents --&gt; DB . ",
+    "url": "/dashboard/#data-flow",
+    
+    "relUrl": "/dashboard/#data-flow"
+  },"53": {
+    "doc": "Dashboard",
+    "title": "Demo tour (≈3 min)",
+    "content": "| Step | Tab | What to show | . | 1 | Configure &amp; Run | Demo mode, max papers 10, run button — global run status strip shows progress | . | 2 | Discovery Results | Ideal candidate profiles · ranked outputs · research hypotheses (left two columns match hypotheses height, scroll when longer); then pipeline diagram; expand Audit &amp; provenance for agent trace + evidence table | . | 3 | Grant Proposal (last tab, static) | Hero KPIs → The proposal (expanded NIH text) → expand Grant pipeline for diagram → expand Pipeline trace &amp; audit for audit sections | . Tabs run left-to-right: Configure &amp; Run · Discovery Results · Grant Proposal. Step 3 is not run-scoped — same graded6 demo regardless of Step 2. Collapsed by default (demo-friendly): Step 2 Audit &amp; provenance · Step 3 Grant pipeline and Pipeline trace &amp; audit (Jump to opens each). Ideal candidate profiles and ranked outputs cap at the research hypotheses body height (panel borders wrap content — no empty box below); scroll when their list is longer. The NIH proposal body stays visible without extra clicks. Stage safety: Pre-run make dashboard before presenting. Use demo mode — no live PubMed pull on stage. See Debugging — safe demo checklist. ",
+    "url": "/dashboard/#demo-tour-3-min",
+    
+    "relUrl": "/dashboard/#demo-tour-3-min"
+  },"54": {
+    "doc": "Dashboard",
+    "title": "UI layout",
+    "content": "Header, tab nav, run status strip, and all three step views share a centered column (max 1400px, 1.5rem side padding) on wide screens. | Area | Content | . | Header | DB status badge and optional run id chip | . | Run status | Ready / Running / Complete / Partial / Failed (all tabs) | . | Step 1 | Discovery run configuration only (no sidebar, local-mode banner, or demo-mode hint clutter) — pipeline mode, disease, max papers, extraction; short rescore banner; Recent runs table | . | Step 2 | KPI strip (papers · trials · grants · subgroups · connections; database totals or this run after a pipeline) above the title; subtitle Cohort, ranked outputs, &amp; hypotheses; Pipeline complete badge; three output panels — research hypotheses sets the scroll cap; ideal candidate profiles and ranked outputs borders fit their content (up to that cap) and scroll when longer (ranked bars label Treatment · Subgroup); discovery pipeline diagram; Audit &amp; provenance collapsed by default | . | Step 3 | Grant Proposal — static graded6 demo. Hero KPIs (corpus · verified papers · citations · Critic F1/F2/F3); The proposal expanded (aims + PubMed ID citations); Grant pipeline in its own collapsed block; toolbar x/y obligations satisfied; pipeline/audit prose behind collapsed Pipeline trace &amp; audit. Jump to → Proposal · Grant pipeline · Supporting details. | . Step 3 — report structure . | Jump to | Layout | Content | . | Proposal | Always visible (first in report) | NIH R01 proposal — significance, innovation, three aims, PubMed ID citation links | . | Grant pipeline | Collapsed block (between proposal and supporting details) | Interactive agent-flow diagram + Open full report link | . | Supporting details | One collapsed group | Contract · dropped args · revise rounds · booster · A/B outcomes · raw trace · audit · ingestion (no build-script footer) | . Step 3 is not run-scoped — it always shows bundled graded6, independent of Step 1/2 run_id. See Conclusion Update — CUA package for live CLI runs. Tab shell (outside the report) . | Area | What it is | . | Static demo badge + About | Fixed graded6 sample (400-paper corpus → 60 verified papers) | . | Corpus vs verified papers | Intro + expandable What are corpus papers &amp; verified papers? — see below | . | F1 / F2 / F3 guide | Always-visible intro + 1–9 score scale (1–4 needs revision · 5–6 meets threshold · 7–9 strong); KPIs show n/9; revise loop typically stops at F1/F2 ≥ 5; expandable cards explain each dimension | . | Run at a glance | KPIs: corpus (full pull) · verified papers (selected for drafting) · citations · Critic F1/F2/F3; expandable guides for corpus and F-scores (no inv-1/inv-2 chip row) | . | Jump to | Proposal scrolls to NIH text; Grant pipeline opens the diagram block; Supporting details opens audit prose | . | Run a live grant proposal (CLI) | Collapsed python -m cua.nih.run_db instructions (writes local files only) | . The proposal (always visible) . The deliverable NIH R01 text: central hypothesis, significance, innovation, and three aims (each with hypothesis, approach, expected outcomes, pitfalls, and corpus citations). This is what the CUA pipeline was building; everything below is provenance. Under each aim, the dashboard rewrites internal corpus ids into readable, linked labels — e.g. literature:28598856 → PubMed ID 28598856 (pubmed.ncbi.nlm.nih.gov), trial:NCT… → ClinicalTrials.gov, grant:R01… → NIH RePORTER search. Non-numeric literature rows show as DOI links. Pipeline trace &amp; audit (one collapsed group) . Expand Pipeline trace &amp; audit (or Jump to → Supporting details) for nine sections: . | Section | What it shows | . | The data loop | Short pointer — expand Grant pipeline above for the interactive diagram; this section has round-by-round narrative only | . | The contract | Blueprint Planner’s obligations — the grading checklist writers and the Critic use (see below) | . | Explored &amp; dropped | Best-of-N at the opening: multiple F1 pitches, one chosen, losers kept for audit | . | The loop, round by round | Revise rounds: citation gate (orphans dropped), F1/F2/F3 scores, revise vs pass | . | The road not taken | Booster: mines papers the writer never saw to harden pitfalls and outcomes | . | Outcomes (A/B) | Blinded judge: did the booster lift F2 rigor? (modest, honest effect sizes) | . | Raw trace | Chronological event log — every LLM and code step per round | . | Audit | Trust record: citation integrity, obligation coverage, overclaim check vs evidence grades | . | Ingestion | Corpus funnel (e.g. 400 → 60 shown); what was held back feeds the booster | . The contract (plain language) . An NIH grant is a structured argument scored on a rubric. Before drafting, the Blueprint Planner turns that rubric into a checklist (~21 obligations in graded6) — that checklist is the contract, not the proposal text. | Group | Meaning | Example obligation | . | F1 | Why this project? (gap, hypothesis, innovation) | Significance names a specific barrier and cites the corpus | . | F2 (per aim) | How you will do the work | Each aim needs testable hypothesis, concrete methods, pitfalls, expected outcomes | . | F3 (per aim) | Can the team do it? | Surface assumed expertise, equipment, access | . | X | Honesty rules | Every cite must exist in corpus; claims cannot exceed evidence grade | . Writers satisfy the contract; the Critic scores against it; the Audit reports satisfied vs at-risk obligations. Corpus vs verified papers . Tab 3 Run at a glance shows two ingestion counts from GET /api/cua/demo → ingestion.corpus_n and ingestion.top_k: . | KPI | Meaning | graded6 demo | . | Corpus papers | Full evidence set CUA pulled from the database for this run — the citation gate (inv-1) checks every cited ID against this full set | 400 | . | Verified papers | Ingestion’s top_k — clustered by similar key_finding, ranked for topic relevance, diversified (per_cluster_cap) so one finding doesn’t dominate. The Synthesizer and revisers draft from this verified slice only | 60 | . ID-preserving: clustering narrows what drafters read; it does not delete sources from the corpus. Papers outside the verified set can still feed the F2 Rigor Booster. Expand Ingestion inside Pipeline trace &amp; audit for the full funnel audit. Critic score scale (F1 / F2 / F3) . Tab 3 Run at a glance shows Critic F1, F2, and F3 as n/9. Each dimension uses the same integer scale: . |   | Value | . | Minimum | 1 (weak — major revision needed) | . | Maximum | 9 (exceptional) | . | Range | Meaning | Dashboard color | . | 1–4 | Needs revision | Red | . | 5–6 | Meets revise-loop threshold | Amber | . | 7–9 | Strong | Green | . The revise loop typically stops when F1 ≥ 5 and F2 ≥ 5 (or max rounds). In the bundled graded6 demo, final scores are F1 = 7, F2 = 5, F3 = 6. Discovery confidence scale (Steps 1–2) . Ranked outputs use a separate 0–100 confidence score (not the 1–9 Critic scale): . |   | Value | . | Minimum | 0 | . | Maximum | 100 | . confidence = evidence_strength × 0.55 + commercial_potential × 0.45 . Both inputs are stored 0–100 on treatment_connections. Tiers: Prioritize ≥ 80 · Monitor 65–79 · Reject &lt; 65. See Output examples — scoring. Best-of-N (plain language) . At the start, the Synthesizer writes N independent opening arguments (four in graded6). The Selection Scorer ranks them on F1 and picks one winner. Rejected pitches never enter the proposal but appear under Explored &amp; dropped with the scorer’s rationale — like keeping losing bids in the file for transparency. Timestamps display in US Eastern (America/New_York). ",
+    "url": "/dashboard/#ui-layout",
+    
+    "relUrl": "/dashboard/#ui-layout"
+  },"55": {
+    "doc": "Dashboard",
+    "title": "API routes used by the UI",
+    "content": "| Panel | Route | . | Step 2 KPI strip (database view) | GET /api/stats | . | Subgroups / connections | GET /api/discover/parkinsons (legacy path; indication-agnostic) | . | Recommendations | GET /api/recommendations?run_id= | . | Recent runs | GET /api/runs | . | Agent trace | GET /api/agents?run_id= | . | Run completion | GET /api/run-discovery/status?run_id= | . | Per-run KPIs | GET /api/run-stats?run_id= | . | Evidence table | GET /api/evidence?offset=&amp;limit= | . | Synthetic patients | GET /api/synthetic-cohort?run_id= | . | Grant proposal (Step 3) | GET /api/cua/demo · report inlined from GET /cua-demo/graded6.html | . ",
+    "url": "/dashboard/#api-routes-used-by-the-ui",
+    
+    "relUrl": "/dashboard/#api-routes-used-by-the-ui"
+  },"56": {
+    "doc": "Dashboard",
+    "title": "Run discovery",
+    "content": "curl -s -X POST http://127.0.0.1:5000/api/run-discovery \\ -H 'Content-Type: application/json' \\ -d '{\"mode\":\"demo\",\"max_papers\":10}' . Default response: { \"run_id\", \"status\": \"running\", \"accepted\": true }. Poll GET /api/run-discovery/status?run_id= or add \"wait\": true for the full payload. See Backend queries — POST /api/run-discovery and Output examples. Recent runs — mode labels . The Recent runs table and /api/runs distinguish all four pipeline modes with stable labels (not generic SCAN / FULL): . | API mode | UI label | Evidence column example | . | agents-only | Rescore DB | 110 rows rescored (no pull) | . | demo | Demo sample | 10 papers (demo sample) | . | scan | Incremental scan | 150 searched · +3 new · 147 skipped · incremental | . | full | Full live pull | 150 papers · 5 trials · +12 stored · 138 skipped | . Literature agent trace summaries are mode-specific: Incremental scan complete: … vs Full live pull complete: … (see pipeline_mode.py). ",
+    "url": "/dashboard/#run-discovery",
+    
+    "relUrl": "/dashboard/#run-discovery"
+  },"57": {
+    "doc": "Dashboard",
+    "title": "Related developer docs",
+    "content": ". | Dashboard API reference — API reference | Backend queries — SQL + JSON shapes | API endpoints — route list | . ",
+    "url": "/dashboard/#related-developer-docs",
+    
+    "relUrl": "/dashboard/#related-developer-docs"
+  },"58": {
+    "doc": "Database schema",
+    "title": "Database schema — NeuroDiscover (Quorum)",
+    "content": "Owner: Person 3 (Ayelet, Data Engineer) Schema source of truth: schema.sql (SQLite) and schema.pg.sql (Postgres) Team shared DB: Supabase (free Postgres) — set SUPABASE_DATABASE_URL in .env . ",
+    "url": "/developer-reference/database/#database-schema--neurodiscover-quorum",
+    
+    "relUrl": "/developer-reference/database/#database-schema--neurodiscover-quorum"
+  },"59": {
+    "doc": "Database schema",
+    "title": "Where the database lives",
+    "content": "| Mode | When | How | . | Supabase (recommended for team) | SUPABASE_DATABASE_URL is set | All agents + Person 2 API use one hosted Postgres | . | Local SQLite | URL unset | neurodiscover.db next to cli.py — offline / solo dev | . Same table names in both modes. Table is evidence, not papers. ",
+    "url": "/developer-reference/database/#where-the-database-lives",
+    
+    "relUrl": "/developer-reference/database/#where-the-database-lives"
+  },"60": {
+    "doc": "Database schema",
+    "title": "SQLite vs MongoDB (working doc)",
+    "content": "The working doc mentions MongoDB. Use Supabase Postgres or local SQLite with this schema — not a separate papers collection. Person 2: see Person 2 backend. ",
+    "url": "/developer-reference/database/#sqlite-vs-mongodb-working-doc",
+    
+    "relUrl": "/developer-reference/database/#sqlite-vs-mongodb-working-doc"
+  },"61": {
+    "doc": "Database schema",
+    "title": "Entity relationship",
+    "content": "erDiagram evidence ||--o{ subgroup_evidence : backs subgroups ||--o{ subgroup_evidence : has subgroups ||--o{ treatment_connections : targets treatment_connections ||--o{ connection_evidence : supported_by evidence ||--o{ connection_evidence : supports treatment_connections ||--o| recommendations : ranks scan_state ||--|| evidence : tracks_scans . ",
+    "url": "/developer-reference/database/#entity-relationship",
+    
+    "relUrl": "/developer-reference/database/#entity-relationship"
+  },"62": {
+    "doc": "Database schema",
+    "title": "Tables",
+    "content": "evidence — one row per source (Agent 1 writes) . Manuscripts, trials, and grants share this table via source_type. | Column | Type | Writer | Reader | Notes | . | evidence_id | INTEGER PK | DB | all agents, backend | Internal id | . | source_type | TEXT | Agent 1 | all | literature | trial | grant | . | source_id | TEXT | Agent 1 | all, dashboard | PMID / DOI / NCT id / grant num | . | title | TEXT | Agent 1 | backend, dashboard |   | . | year | INTEGER | Agent 1 | Agent 4 (skeptic) |   | . | venue | TEXT | Agent 1 | dashboard | Journal or ClinicalTrials.gov | . | subgroup | TEXT | Agent 1 | Agents 2–3 | Free-text tag; prefer seeded names | . | mechanism | TEXT | Agent 1 | Agents 3–6 |   | . | treatment | TEXT | Agent 1 | Agents 3–6 |   | . | key_result | TEXT | Agent 1 | all | 1–2 sentence distilled finding | . | study_type | TEXT | Agent 1 | dashboard, future weighting | in vitro / mouse / cohort / RCT / Phase 2 … | . | sample_size | INTEGER | Agent 1 | dashboard, future weighting | Populated on trials; optional on literature | . | evidence_snippet | TEXT | Agent 1 | dashboard | ≤15 word citation line | . | url | TEXT | Agent 1 | dashboard | PubMed or ClinicalTrials.gov link | . | doi | TEXT | Agent 1 | backend | Secondary stable id | . | access_status | TEXT | Agent 1 | Agent 4, dashboard | open | abstract_only | restricted | error | unknown (synced from access_type) | . | abstract | TEXT | Agent 1 | Agent 4 | Full abstract from PubMed/BioMCP | . | methods_text | TEXT | Agent 1 | Agent 4 | Methods excerpt (~2k chars) when OA full text fetched | . | results_text | TEXT | Agent 1 | Agent 4 | Results excerpt | . | discussion_text | TEXT | Agent 1 | Agent 4 | Discussion excerpt (~1k chars) | . | access_type | TEXT | Agent 1 | Agent 4 | published_oa | published_paywalled | preprint | error | unknown | . | full_text_url | TEXT | Agent 1 | dashboard | OA / preprint full-text link | . | is_preprint | INTEGER/BOOLEAN | Agent 1 | Agent 4 | 1/true for bioRxiv preprints | . | publication_year | INTEGER | Agent 1 | Agent 4 | Explicit year from pull (mirrors year) | . | pulled_at | TEXT | DB default | backend | First insert time | . | last_scanned_at | TEXT | Agent 1 | scan logic | Updated on incremental scan hits | . Light processing (Agent 1): LLM extracts subgroup, mechanism, treatment, key_result, evidence_snippet. Agents 4–5 score from evidence counts and source types in current code (not study_type / sample_size columns directly). Existing DBs: run migrations in order: . | ../../neurodiscover/migrations/001_evidence_light_processing.sql | ../../neurodiscover/migrations/002_evidence_mcp_metadata.sql | . Or python3 cli.py build locally for a fresh SQLite DB. See Literature pull for two-stage pull details. Dedup: UNIQUE(source_type, source_id) — re-pulls insert with INSERT OR IGNORE. Demo ids: Seed uses DEMO-* placeholders. Live pull replaces with real PMIDs/NCT ids. Never present DEMO ids as real to judges. subgroups — Agent 2 writes (seed pre-populates demo) . | Column | Writer | Notes | . | name | Agent 2 | UNIQUE, e.g. GBA-mutation PD | . | defining_features | Agent 2 |   | . | notes | Agent 2 | optional | . treatment_connections — Agent 3 writes; Agents 4–5 update scores . | Column | Writer | Notes | . | subgroup_id | Agent 3 | FK → subgroups | . | mechanism | Agent 3 |   | . | treatment | Agent 3 | UNIQUE per (subgroup_id, treatment) | . | evidence_strength | Agent 4 | 0–100 | . | commercial_potential | Agent 5 | 0–100 | . Join tables . | subgroup_evidence — links evidence to subgroups (Agent 1 auto-links on name match; seed loader fills demo) | connection_evidence — links evidence to treatment connections (Agent 3) | . agent_outputs — every agent appends one row per run step . Dashboard reads this for the agent trace. recommendations — Agent 6 writes . confidence = evidence_strength * 0.55 + commercial_potential * 0.45 tier: Prioritize (≥80) | Monitor (65–79) | Reject (&lt;65) . scan_state — singleton (Agent 1) . | Column | Purpose | . | disease | Last scanned disease query | . | last_scan_at | Timestamp of last successful scan | . | last_run_id | Links to agent_outputs.run_id | . ",
+    "url": "/developer-reference/database/#tables",
+    
+    "relUrl": "/developer-reference/database/#tables"
+  },"63": {
+    "doc": "Database schema",
+    "title": "MongoDB field mapping (Person 2)",
+    "content": "If mirroring to MongoDB, use these names: . | SQLite evidence | Suggested Mongo field | . | evidence_id | _evidenceId or omit (use source_type+source_id as key) | . | source_type | sourceType | . | source_id | sourceId | . | key_result | keyResult | . | study_type | studyType | . | sample_size | sampleSize | . | evidence_snippet | evidenceSnippet | . | access_status | accessStatus | . | last_scanned_at | lastScannedAt | . Collection name: evidence (not papers). ",
+    "url": "/developer-reference/database/#mongodb-field-mapping-person-2",
+    
+    "relUrl": "/developer-reference/database/#mongodb-field-mapping-person-2"
+  },"64": {
+    "doc": "Database schema",
+    "title": "Commands",
+    "content": "Run from the neurodiscover/ package directory: . cd neurodiscover python3 cli.py build # rebuild from schema + seed python3 cli.py validate # FK / schema checks python3 cli.py show # row counts python3 cli.py pull # full BioMCP + Nebius backfill python3 cli.py scan --max 5 # incremental low-cost scan python3 cli.py demo # offline safe demo path . ",
+    "url": "/developer-reference/database/#commands",
+    
+    "relUrl": "/developer-reference/database/#commands"
+  },"65": {
+    "doc": "Database schema",
+    "title": "Team collaboration — where the database lives",
+    "content": "SQLite is the blackboard, but each developer keeps their own local file. | Artifact | In git? | Notes | . | neurodiscover/schema.sql | Yes | Schema source of truth — keep in sync with code | . | neurodiscover/seed_data.json | Yes | Reproducible demo; everyone runs cli.py build | . | neurodiscover/neurodiscover.db | No (.gitignore) | Built locally; do not commit or merge binary DBs | . | Optional demo snapshot | Rarely, demo branch only | Judge backup if APIs fail — prefer seed + pre-pull | . Simultaneous work rules: . | Do not point multiple laptops at one shared .db on Google Drive, NFS, or git LFS — concurrent writes corrupt SQLite. | Do run agents sequentially on one machine (Agent 1 → 6) against one DB file. | Parallel dev: set a private DB path per person: export NEURODISCOVER_DB=/tmp/alice-neurodiscover.db cd neurodiscover &amp;&amp; python3 cli.py build . | Live literature pulls: coordinate so one person runs pull/scan; others use build + seed or copy a announced DB path once (read-only). | . PRAGMA journal_mode=WAL is enabled for multiple readers on the same machine (e.g. backend + agent); it does not fix multi-writer across machines. ",
+    "url": "/developer-reference/database/#team-collaboration--where-the-database-lives",
+    
+    "relUrl": "/developer-reference/database/#team-collaboration--where-the-database-lives"
+  },"66": {
+    "doc": "Database schema",
+    "title": "Continuous scan (minimal cost)",
+    "content": "Cost driver is Nebius LLM, not BioMCP (free). | Cron every 6h: 0 */6 * * * cd /path/to/Quorum/neurodiscover &amp;&amp; python3 cli.py scan --max 5 | Scan skips LLM for existing (source_type, source_id) — only updates last_scanned_at | New hits: fetch abstract (free) → LLM extract once → INSERT | Use cheap model in .env: NEBIUS_MODEL=nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B | . ",
+    "url": "/developer-reference/database/#continuous-scan-minimal-cost",
+    
+    "relUrl": "/developer-reference/database/#continuous-scan-minimal-cost"
+  },"67": {
+    "doc": "Database schema",
+    "title": "Do not change without team sync",
+    "content": "Renaming columns or tables requires updating schema.sql, schema.pg.sql, docs/developer-reference/database.md, and docs/developer-reference/agent-io.md. ",
+    "url": "/developer-reference/database/#do-not-change-without-team-sync",
+    
+    "relUrl": "/developer-reference/database/#do-not-change-without-team-sync"
+  },"68": {
+    "doc": "Database schema",
+    "title": "Database schema",
+    "content": " ",
+    "url": "/developer-reference/database/",
+    
+    "relUrl": "/developer-reference/database/"
+  },"69": {
+    "doc": "Debugging",
+    "title": "Debugging",
+    "content": "Common issues for local development, GitHub Pages deploy, and live demo. ",
+    "url": "/debugging/",
+    
+    "relUrl": "/debugging/"
+  },"70": {
+    "doc": "Debugging",
+    "title": "GitHub Pages (neurodiscover.github.io)",
+    "content": "| Symptom | Fix | . | Deploy Action failed, git exit 128 | Check secret NEURODISCOVERY_DOCS in Quorum → Settings → Secrets. Classic PAT needs repo scope; authorize SSO for neurodiscover org. | . | Deploy green but site 404 | neurodiscover/neurodiscover.github.io → Settings → Pages → Deploy from branch → main / root. Wait 2–5 min; hard-refresh. | . | Unstyled / broken links | Confirm docs/_config.yml has url: https://neurodiscover.github.io and baseurl: \"\". | . | Old content after push | Actions → Deploy docs to neurodiscover.github.io → confirm latest run on main succeeded. | . See Site publishing for full setup. ",
+    "url": "/debugging/#github-pages-neurodiscovergithubio",
+    
+    "relUrl": "/debugging/#github-pages-neurodiscovergithubio"
+  },"71": {
+    "doc": "Debugging",
+    "title": "Dashboard &amp; API",
+    "content": "Dashboard won’t start . cd neurodiscover python3 --version # must be 3.10.x – 3.12.x pip install -r requirements.txt # or: conda activate neurodiscover python3 cli.py validate python3 cli.py dashboard --no-browser . Not Mac-only: make dashboard works on macOS, Linux, and Windows. On Windows use python cli.py dashboard if make is missing. On headless/SSH use --no-browser and open the Open: URL printed by the launcher (includes ?api=). On macOS, port 5000 may conflict with AirPlay — launcher auto-fallbacks or use --port-api 5001 --port-ui 8081. | Error | Fix | . | Port 5000 or 8080 in use | Launcher auto-tries the next free port (e.g. 5001). Or stop other processes: lsof -i :8080. Manual override: python3 cli.py dashboard --port-api 5001 --port-ui 8081 | . | make: command not found | Use python3 cli.py dashboard instead | . | Browser does not open | Expected on SSH/WSL — use --no-browser and copy the Open: URL from launcher output | . | Module not found | Run from neurodiscover/; Python 3.10–3.12; pip install -r requirements.txt or conda env update -f environment.yml --prune | . | biomcp not found | Re-install deps; which biomcp should point inside your venv/conda env | . | DB errors | Local: python3 cli.py build (local only). Team Supabase: set SUPABASE_DATABASE_URL, never build. | . API smoke test . Use the API port from launcher output (default 5000; may be 5001+ after auto-fallback). curl -s http://127.0.0.1:5000/api/stats curl -s http://127.0.0.1:5000/api/runs?limit=3 curl -s -X POST http://127.0.0.1:5000/api/run-discovery \\ -H 'Content-Type: application/json' \\ -d '{\"mode\":\"demo\",\"max_papers\":10}' . Default POST returns { \"run_id\", \"status\": \"running\", \"accepted\": true }. Poll GET /api/run-discovery/status?run_id=YOUR_RUN_ID until complete, or add \"wait\": true to the POST for the full payload (recommendations, agent_outputs, runStats). ",
+    "url": "/debugging/#dashboard--api",
+    
+    "relUrl": "/debugging/#dashboard--api"
+  },"72": {
+    "doc": "Debugging",
+    "title": "Pipeline run status",
+    "content": "| UI status | Meaning | . | Complete | All 6 agents logged for run_id + ≥1 recommendation — or ≥5 recommendations with partial trace (run_status.py) | . | Partial | Stopped early — check agent trace count (e.g. 3/6) | . | Failed | Exception in orchestrator — see API terminal logs | . Partial run checklist . | Literature step returned zero rows → check max_papers, DB has evidence | Missing Nebius/Ollama keys → set EXTRACT_BACKEND=none for metadata-only demo | Team DB empty locally → run python3 cli.py build once (local only) or set Supabase URL | . ",
+    "url": "/debugging/#pipeline-run-status",
+    
+    "relUrl": "/debugging/#pipeline-run-status"
+  },"73": {
+    "doc": "Debugging",
+    "title": "Literature pull",
+    "content": "cd neurodiscover python3 cli.py pull --disease \"your condition\" --max 10 --no-pubtator python3 cli.py scan --max 5 . | Issue | Fix | . | BioMCP not found | Install biomcp-python; check PUBMED_MCP_COMMAND in .env | . | No new rows | Duplicates skipped — normal for re-pull; try new --query | . | Slow / timeout | Reduce --max; use scan for incremental | . | Invented ids rejected | Only BioMCP-returned ids are inserted — expected behavior | . ",
+    "url": "/debugging/#literature-pull",
+    
+    "relUrl": "/debugging/#literature-pull"
+  },"74": {
+    "doc": "Debugging",
+    "title": "Jekyll docs (local)",
+    "content": "cd docs bundle install bundle exec jekyll serve # → http://127.0.0.1:4000 . | Issue | Fix | . | jekyll: command not found | bundle exec jekyll serve | . | Theme errors | bundle install in docs/; Ruby 3.3+ | . ",
+    "url": "/debugging/#jekyll-docs-local",
+    
+    "relUrl": "/debugging/#jekyll-docs-local"
+  },"75": {
+    "doc": "Debugging",
+    "title": "Logs &amp; trace",
+    "content": "| What | Where | . | Agent trace | Dashboard Step 2, or GET /api/agents?run_id= | . | Run status stuck on Running | Hard-refresh after updating dashboard; global run status strip should show Running then Complete when GET /api/run-discovery/status finishes | . | Confidence unchanged after pull | Check literature trace for Stored 0 new; new rows need subgroup/mechanism/treatment. Rescore alone does not add rows. See Output — when confidence changes | . | API server logs | Terminal running api_server.py / make dashboard | . | GitHub deploy | Quorum → Actions → Deploy docs to neurodiscover.github.io | . | DB inspect | python3 cli.py show evidence or python3 cli.py query \"SELECT ...\" | . ",
+    "url": "/debugging/#logs--trace",
+    
+    "relUrl": "/debugging/#logs--trace"
+  },"76": {
+    "doc": "Debugging",
+    "title": "Pre-flight (local, before showcase)",
+    "content": "Run once on the laptop you will present from: . cd neurodiscover python3 cli.py validate python3 -c \" import uuid from orchestrator import run r = run(mode='demo', max_papers=10, run_id=uuid.uuid4().hex[:8]) assert len(r.get('recommendations', [])) &gt;= 1 assert len(r.get('agent_outputs', [])) &gt;= 6 print('demo pipeline OK — run_id', r.get('run_id')) \" make dashboard --no-browser # pre-run; open the Open: URL (includes ?api=) . Step 3 smoke test (with API running): curl -s http://127.0.0.1:5000/api/cua/demo should report ingestion.corpus_n 400 and ingestion.top_k 60; /cua-demo/graded6.html should return NIH proposal HTML. Docs site: pushes to docs/** on main trigger Deploy docs to neurodiscover.github.io (Quorum → Actions). Confirm the latest run succeeded; live site at neurodiscover.github.io. ",
+    "url": "/debugging/#pre-flight-local-before-showcase",
+    
+    "relUrl": "/debugging/#pre-flight-local-before-showcase"
+  },"77": {
+    "doc": "Debugging",
+    "title": "Safe demo checklist (stage)",
+    "content": ". | Run make dashboard before presenting (not live pull on stage) | Mode demo, max papers 10 (launcher default; API allows 10–500) | No cli.py build against team Supabase | Browser at the launcher Open: URL (includes ?api=; not a stale GitHub Pages tab for live UI) | Step 1 — pipeline mode + run button; global run status shows progress | Step 2 — KPI strip above title (this run counts after pipeline); Pipeline complete badge, three output panels (profiles · ranked outputs match hypotheses height, scroll when longer · hypotheses); Audit &amp; provenance collapsed until you expand it for agent trace | Step 3 — Grant Proposal (last tab, static) — hero KPIs; The proposal expanded; Grant pipeline and Pipeline trace &amp; audit collapsed; toolbar shows x/y obligations satisfied | Fallback docs: neurodiscover.github.io · screenshots on Output examples and Inputs | Mode questions: Inputs — pipeline modes FAQ (Demo vs Rescore, incremental vs full, full does not clear DB) | . ",
+    "url": "/debugging/#safe-demo-checklist-stage",
+    
+    "relUrl": "/debugging/#safe-demo-checklist-stage"
+  },"78": {
+    "doc": "Architecture",
+    "title": "Architecture decisions",
+    "content": "Why we built NeuroDiscover this way. ",
+    "url": "/decisions/#architecture-decisions",
+    
+    "relUrl": "/decisions/#architecture-decisions"
+  },"79": {
+    "doc": "Architecture",
+    "title": "SQLite / Postgres, not MongoDB",
+    "content": "Early working docs mentioned MongoDB papers. The canonical store is SQL table evidence with FK integrity, shared via Supabase Session pooler or local neurodiscover.db. ",
+    "url": "/decisions/#sqlite--postgres-not-mongodb",
+    
+    "relUrl": "/decisions/#sqlite--postgres-not-mongodb"
+  },"80": {
+    "doc": "Architecture",
+    "title": "Database as blackboard",
+    "content": "Agents do not call each other directly. They read/write tables so the API, agents, and dashboard can evolve independently. ",
+    "url": "/decisions/#database-as-blackboard",
+    
+    "relUrl": "/decisions/#database-as-blackboard"
+  },"81": {
+    "doc": "Architecture",
+    "title": "No cli.py build on live Supabase",
+    "content": "build truncates all tables. The team DB already has 300+ real rows. Use scan / pull to add evidence only. ",
+    "url": "/decisions/#no-clipy-build-on-live-supabase",
+    
+    "relUrl": "/decisions/#no-clipy-build-on-live-supabase"
+  },"82": {
+    "doc": "Architecture",
+    "title": "Vanilla dashboard + FastAPI",
+    "content": "Single index.html and api_server.py avoid build tooling for hackathon demos. Optional Supabase JS keys for direct reads; default path is API-only (no browser secrets). ",
+    "url": "/decisions/#vanilla-dashboard--fastapi",
+    
+    "relUrl": "/decisions/#vanilla-dashboard--fastapi"
+  },"83": {
+    "doc": "Architecture",
+    "title": "Synthetic cohort not persisted",
+    "content": "Patient profiles are generated from recommendations + subgroups per run_id, labeled synthetic/no PHI, and never stored — reducing HIPAA scope. ",
+    "url": "/decisions/#synthetic-cohort-not-persisted",
+    
+    "relUrl": "/decisions/#synthetic-cohort-not-persisted"
+  },"84": {
+    "doc": "Architecture",
+    "title": "Run status: Complete vs Partial",
+    "content": "Complete means all six pipeline agents logged output for that run_id and ≥1 recommendation exists — or ≥5 recommendations with a partial trace (see run_status.py). Partial means the run stopped early — not a judgment on data quality. ",
+    "url": "/decisions/#run-status-complete-vs-partial",
+    
+    "relUrl": "/decisions/#run-status-complete-vs-partial"
+  },"85": {
+    "doc": "Architecture",
+    "title": "External tools",
+    "content": "| Tool | Role | . | BioMCP | Unified PubMed + ClinicalTrials.gov | . | Nebius / Ollama | Structured extraction (EXTRACT_BACKEND) | . | NIH RePORTER | Grants via cli.py pull-grants or full mode (pull_grants=true) | . ",
+    "url": "/decisions/#external-tools",
+    
+    "relUrl": "/decisions/#external-tools"
+  },"86": {
+    "doc": "Architecture",
+    "title": "Documentation site",
+    "content": "This site uses Just the Docs on GitHub Pages. Published to https://neurodiscover.github.io via the neurodiscover/neurodiscover.github.io org repo (see Site publishing). For modularity, layering, and engineering patterns (not just trade-offs), see Design &amp; engineering. ",
+    "url": "/decisions/#documentation-site",
+    
+    "relUrl": "/decisions/#documentation-site"
+  },"87": {
+    "doc": "Architecture",
+    "title": "Architecture",
+    "content": " ",
+    "url": "/decisions/",
+    
+    "relUrl": "/decisions/"
+  },"88": {
+    "doc": "Design & engineering",
+    "title": "Design &amp; engineering",
+    "content": "How NeuroDiscover is structured for modularity, team parallel work, and production-grade behavior — beyond the one-page trade-offs in Architecture decisions. ",
+    "url": "/design/#design--engineering",
+    
+    "relUrl": "/design/#design--engineering"
+  },"89": {
+    "doc": "Design & engineering",
+    "title": "Design principles",
+    "content": "| Principle | What it means in this repo | . | Modularity | Each agent is a separate module with a single responsibility; ingestion, orchestration, API, and UI are independent packages. | . | Contract-first | SQL schema + docs (Database schema, Agent I/O) define what agents may read/write — not ad hoc JSON between teammates. | . | Blackboard, not message passing | Agents communicate through tables (evidence, subgroups, treatment_connections, …), not direct Python calls. | . | Auditability | Every pipeline run appends to agent_outputs with a shared run_id; recommendations cite real source_id values. | . | Safe iteration | Incremental scan, demo mode, and agents-only rescoring let you develop without repeated full PubMed pulls. | . | Indication-agnostic core | Disease/query are runtime parameters; Parkinson’s is the demo default, not a hard-coded code path. | . ",
+    "url": "/design/#design-principles",
+    
+    "relUrl": "/design/#design-principles"
+  },"90": {
+    "doc": "Design & engineering",
+    "title": "Modular architecture",
+    "content": "flowchart TB subgraph external [External sources] PubMed[PubMed / bioRxiv] Trials[ClinicalTrials.gov] Grants[NIH RePORTER] end subgraph ingestion [Ingestion layer] Pub[published_pull.py] Bio[biorxiv_pull.py] Gr[grants_pull.py] Tags[evidence_tags.py] end subgraph agents [Agent modules — one file each] A1[literature_agent.py] A2[patient_subgroup_agent.py] A3[treatment_connection_agent.py] A4[evidence_scoring_agent.py] A5[commercial_discovery_agent.py] A6[conclusion via orchestrator] end subgraph core [Shared core] Orch[orchestrator.py] Mode[pipeline_mode.py] DB[(SQLite / Postgres)] end subgraph surface [Surfaces] API[api_server.py] UI[frontend/index.html] CLI[cli.py] end PubMed --&gt; Pub Trials --&gt; A1 Grants --&gt; Gr Pub --&gt; A1 Bio --&gt; A1 Gr --&gt; DB A1 --&gt; DB Orch --&gt; A2 --&gt; A3 --&gt; A4 --&gt; A5 --&gt; A6 A2 &amp; A3 &amp; A4 &amp; A5 --&gt; DB DB --&gt; API --&gt; UI CLI --&gt; Orch Orch --&gt; Mode . Layer responsibilities . | Layer | Location | Role | . | Ingestion | neurodiscover/ingestion/ | PubMed pull, preprints, grants, shared tag inference — no agent scoring logic | . | Agents | neurodiscover/agents/ | Pure(ish) functions: read rows → return structured dict → orchestrator persists | . | Orchestrator | orchestrator.py | Mode routing (demo / scan / full / agents-only), run_id, commits after each agent, run stats | . | API | api_server.py | HTTP contract for dashboard; no business logic duplicated from agents | . | Dashboard | frontend/index.html | Vanilla JS UI; polls agent_outputs for live pipeline progress on Step 1 | . | Contracts | schema.sql, schema.pg.sql, docs/developer-reference/ | Team source of truth for columns and I/O | . Agents do not import each other. Agent 3 never calls Agent 2 — both read evidence through orchestrator-supplied rows. That lets Person 4 teammates implement agents in parallel without merge conflicts in shared classes. ",
+    "url": "/design/#modular-architecture",
+    
+    "relUrl": "/design/#modular-architecture"
+  },"91": {
+    "doc": "Design & engineering",
+    "title": "Database blackboard pattern",
+    "content": "The pipeline is intentionally sequential in business logic but decoupled in code: . | Agent 1 writes evidence, subgroup_evidence, scan_state | Agent 2 writes subgroups | Agent 3 writes treatment_connections, connection_evidence | Agents 4–5 update score columns on treatment_connections | Agent 6 writes recommendations | . The FastAPI backend and dashboard only read these tables — they never embed agent rules. Adding a seventh agent means a new module + schema columns documented in Agent I/O, not rewriting the UI. ",
+    "url": "/design/#database-blackboard-pattern",
+    
+    "relUrl": "/design/#database-blackboard-pattern"
+  },"92": {
+    "doc": "Design & engineering",
+    "title": "Technical proficiency highlights",
+    "content": "Dual-database support . One codebase runs against local SQLite (hackathon laptop) or Supabase Postgres (team shared DB) via db.py and parallel schema files. Same agents, same API — connection string switches the backend. Structured extraction pipeline . Literature rows are distilled to a fixed column set (subgroup, mechanism, treatment, key_result, …), not stored as opaque LLM blobs. Extraction backends are pluggable: . | Backend | Use case | . | Nebius | Cloud LLM (default for live demos) | . | Ollama | Local LLM | . | none | Metadata-only / incremental scan without re-extraction cost | . Post-pull validation (validation/consistency.py, optional PubTator spot-check) catches hallucinated fields before they enter scoring. Incremental vs full pull (by design) . | Mode | Engineering intent | . | Incremental scan | Skip LLM for known source_ids; cheap repeated runs; trace tagged Incremental scan complete | . | Full live pull | New PubMed + trials + optional preprints, full text, grants; trace tagged Full live pull complete | . Mode detection and UI labels live in pipeline_mode.py so runs history, API, and dashboard stay consistent. See Dashboard — Recent runs. Live pipeline observability . Long literature pulls commit progress rows to agent_outputs during processing (not only at the end). The dashboard polls every ~500ms and drives a weighted progress bar (literature ≈45%, downstream agents ≈11% each) — suitable for 150+ paper scans without a fake progress animation. Scoring that responds to evidence . Confidence is not a static lookup table. evidence_strength and commercial_potential scale with per-connection support counts so new pulls move rankings when the corpus grows. Formula: . confidence = evidence_strength × 0.55 + commercial_potential × 0.45 . Operational safety . | cli.py build blocked on team DB — documented everywhere; truncates live Supabase | Synthetic cohort generated, not stored — HIPAA-safe demo visuals without PHI in Postgres | No invented PMIDs/NCT ids — extraction and seed data enforce real or explicit DEMO-* placeholders | Grant title backfill — keyword inference + backfill so grants enter agents 2–6 without manual tagging | . Testing &amp; validation . | Mechanism | Purpose | . | cli.py validate | FK and schema sanity after seed or migration | . | pipeline_mode.py | Unit-testable mode detection and evidence-note formatting | . | run_status.py | Consistent Complete / Partial semantics for dashboard and API | . | Extraction QA | Optional strict pull + validation report after literature ingest | . ",
+    "url": "/design/#technical-proficiency-highlights",
+    
+    "relUrl": "/design/#technical-proficiency-highlights"
+  },"93": {
+    "doc": "Design & engineering",
+    "title": "Extensibility",
+    "content": "New indication: change disease / query in CLI or API — BioMCP search anchor updates; subgroup names still come from evidence extraction (seed provides five PD examples). New source type: extend evidence.source_type CHECK, ingestion module, and Database schema — agents 2–6 already key off source_type for scoring bonuses. New agent: add module under agents/, document I/O, wire step in orchestrator.py, append to PIPELINE_AGENTS in UI — blackboard pattern avoids refactoring prior agents. New dashboard panel: add GET route in api_server.py reading existing tables; no agent changes required. ",
+    "url": "/design/#extensibility",
+    
+    "relUrl": "/design/#extensibility"
+  },"94": {
+    "doc": "Design & engineering",
+    "title": "Documentation &amp; team scale",
+    "content": "NeuroDiscover was built for a multi-person hackathon split (data engineer, backend, agent authors, dashboard): . | Doc | Audience | . | Agent I/O | What each agent reads/writes | . | Backend queries | Copy-paste SQL for API shapes | . | Dashboard API | UI ↔ FastAPI contract | . | Validation | Post-pull QA | . Schema changes require updating schema.sql, schema.pg.sql, and docs together — preventing silent drift between SQLite demo and Supabase production. ",
+    "url": "/design/#documentation--team-scale",
+    
+    "relUrl": "/design/#documentation--team-scale"
+  },"95": {
+    "doc": "Design & engineering",
+    "title": "UI engineering choices",
+    "content": ". | Vanilla HTML/CSS/JS — no bundler; demo-ready on any laptop after pip install | Three-tab navigation — centered column (max 1400px): Step 1 configure &amp; run · Step 2 discovery results (KPI strip · three output panels; Audit &amp; provenance collapsed) · Step 3 static grant proposal (graded6; expanded proposal · collapsed Grant pipeline + Pipeline trace &amp; audit; Jump to nav) | FastAPI + optional Supabase anon keys — API-first; browser secrets optional | US Eastern timestamps — consistent judge-facing run history | . See Run the dashboard for the full UI tour. ",
+    "url": "/design/#ui-engineering-choices",
+    
+    "relUrl": "/design/#ui-engineering-choices"
+  },"96": {
+    "doc": "Design & engineering",
+    "title": "Related pages",
+    "content": ". | Architecture decisions — specific trade-offs (SQLite vs MongoDB, synthetic cohort, etc.) | Workflow — per-agent behavior | Problem &amp; significance — why agentic discovery fits Pfizer Commercial Development Discovery | Developer reference — schema and API depth | . ",
+    "url": "/design/#related-pages",
+    
+    "relUrl": "/design/#related-pages"
+  },"97": {
+    "doc": "Design & engineering",
+    "title": "Design & engineering",
+    "content": " ",
+    "url": "/design/",
+    
+    "relUrl": "/design/"
+  },"98": {
+    "doc": "Evidence Scoring",
+    "title": "Agent 4 — Evidence Scoring (Skeptic)",
+    "content": "Module: neurodiscover/agents/evidence_scoring_agent.py Owner: Alia Merchant Step order: 4 (orchestrator logs trace) . ",
+    "url": "/workflow/evidence-scoring/#agent-4--evidence-scoring-skeptic",
+    
+    "relUrl": "/workflow/evidence-scoring/#agent-4--evidence-scoring-skeptic"
+  },"99": {
+    "doc": "Evidence Scoring",
+    "title": "Role",
+    "content": "Act as a skeptic — score how strong the evidence is for each treatment connection from per-connection evidence count and source types (literature, trial, grant) on rows matching the same subgroup + mechanism + treatment triple. ",
+    "url": "/workflow/evidence-scoring/#role",
+    
+    "relUrl": "/workflow/evidence-scoring/#role"
+  },"100": {
+    "doc": "Evidence Scoring",
+    "title": "Reads",
+    "content": "In-memory connections from Agent 3 plus evidence rows passed by the orchestrator that match each connection’s subgroup, mechanism, and treatment (not all rows for the subgroup). Not used in current code: per-row study_type, sample_size, or access_status (those columns exist on evidence for future weighting). ",
+    "url": "/workflow/evidence-scoring/#reads",
+    
+    "relUrl": "/workflow/evidence-scoring/#reads"
+  },"101": {
+    "doc": "Evidence Scoring",
+    "title": "Writes (via orchestrator)",
+    "content": "UPDATE treatment_connections SET evidence_strength = ? WHERE connection_id = ?; . The orchestrator calls _scale_score() (×10) before UPDATE, so the DB column holds 0–100. | Stage | Minimum | Maximum | . | Agent output (evidence_strength heuristic) | 0 | 10 | . | Stored on treatment_connections | 0 | 100 | . ",
+    "url": "/workflow/evidence-scoring/#writes-via-orchestrator",
+    
+    "relUrl": "/workflow/evidence-scoring/#writes-via-orchestrator"
+  },"102": {
+    "doc": "Evidence Scoring",
+    "title": "Scoring heuristics (code)",
+    "content": "Scores scale with support count so new pulls that add rows to a connection move the number (not flat buckets only). | Signal | Effect | . | Base + volume | 4.0 + min(4.5, evidence_count × 0.22) | . | Has literature in matching rows | +0.6 | . | Has trial in matching rows | +0.8 | . | Has grant in matching rows | +0.4 | . Capped at 10.0 before orchestrator scaling (×10 → stored 0–100 on treatment_connections). Adding a few supporting papers or trials to an existing connection typically changes evidence_strength by ~0.2–0.5 (pre-scale) per row. ",
+    "url": "/workflow/evidence-scoring/#scoring-heuristics-code",
+    
+    "relUrl": "/workflow/evidence-scoring/#scoring-heuristics-code"
+  },"103": {
+    "doc": "Evidence Scoring",
+    "title": "Example (agent output, pre-scale)",
+    "content": "| Connection | evidence_strength | . | GBA → GCase activation | 8.5 | . | Rapid progressors → combination neuroprotection (combination strategy) | 5.2 | . Agent 5 adds commercial_potential; Agent 6 combines scaled DB values into confidence. ",
+    "url": "/workflow/evidence-scoring/#example-agent-output-pre-scale",
+    
+    "relUrl": "/workflow/evidence-scoring/#example-agent-output-pre-scale"
+  },"104": {
+    "doc": "Evidence Scoring",
+    "title": "Evidence Scoring",
+    "content": " ",
+    "url": "/workflow/evidence-scoring/",
+    
+    "relUrl": "/workflow/evidence-scoring/"
+  },"105": {
+    "doc": "Guides",
+    "title": "Developer guides",
+    "content": "Run, verify, and extend NeuroDiscover. ",
+    "url": "/guides/#developer-guides",
+    
+    "relUrl": "/guides/#developer-guides"
+  },"106": {
+    "doc": "Guides",
+    "title": "Dashboard",
+    "content": "pip: . git clone https://github.com/kahinimehta/Quorum.git cd Quorum/neurodiscover python3 --version # must be 3.10.x – 3.12.x pip install -r requirements.txt cp .env.example .env make dashboard # same as: python3 cli.py dashboard . conda (empty environment): . git clone https://github.com/kahinimehta/Quorum.git cd Quorum/neurodiscover conda env create -f environment.yml conda activate neurodiscover cp .env.example .env make dashboard . Local SQLite: builds seed DB if needed, runs demo pipeline (max_papers=10). Team Supabase: skips build, runs agents-only on existing evidence (connections + recommendations written automatically). Pipeline modes (when to use which): Inputs — recommended workflow · Demo vs Rescore · Incremental vs full · Does full clear the DB? · Run times . ",
+    "url": "/guides/#dashboard",
+    
+    "relUrl": "/guides/#dashboard"
+  },"107": {
+    "doc": "Guides",
+    "title": "CLI (data &amp; agents)",
+    "content": "python3 cli.py build # local DB only — truncates tables python3 cli.py validate # FK / schema checks python3 cli.py demo # offline literature agent python3 cli.py scan --max 5 # incremental scan python3 cli.py pull --max 150 # published papers python3 cli.py pull-grants # NIH RePORTER . On the team Supabase database, do not run build. Set SUPABASE_DATABASE_URL and use scan / pull only. ",
+    "url": "/guides/#cli-data--agents",
+    
+    "relUrl": "/guides/#cli-data--agents"
+  },"108": {
+    "doc": "Guides",
+    "title": "API verify",
+    "content": "Use the API port from launcher output (default 5000). curl -s http://127.0.0.1:5000/api/stats curl -s http://127.0.0.1:5000/api/recommendations curl -s -X POST http://127.0.0.1:5000/api/run-discovery \\ -H 'Content-Type: application/json' \\ -d '{\"mode\":\"demo\",\"max_papers\":10,\"wait\":true}' . ",
+    "url": "/guides/#api-verify",
+    
+    "relUrl": "/guides/#api-verify"
+  },"109": {
+    "doc": "Guides",
+    "title": "Environment",
+    "content": "cp .env.example .env . | Variable | Purpose | . | SUPABASE_DATABASE_URL | Team Postgres (Session pooler) | . | EXTRACT_BACKEND | nebius | ollama | none | . | NEBIUS_* / OLLAMA_* | LLM extraction credentials | . | ANTHROPIC_API_KEY | Optional — live CUA runs only (cua/) | . | CUA_LIVE=1 | Optional — enable live LLM roles in CUA | . ",
+    "url": "/guides/#environment",
+    
+    "relUrl": "/guides/#environment"
+  },"110": {
+    "doc": "Guides",
+    "title": "CUA — NIH grant proposal (Step 3)",
+    "content": "Dashboard Step 3 shows a static bundled demo (graded6) with hero KPIs (corpus papers = full pull, verified papers = top-K slice selected for drafting — see Dashboard — Corpus vs verified papers), Jump to nav (Proposal · Grant pipeline · Supporting details), and an inlined report: The proposal expanded at the top; Grant pipeline and Pipeline trace &amp; audit each in their own collapsed block. Toolbar shows x/y obligations satisfied. Step 2 ideal candidate profiles and ranked outputs match research hypotheses column height and scroll when their content is longer. To generate a new proposal from your DB: . cd cua &amp;&amp; pip install -e . export ANTHROPIC_API_KEY=... CUA_LIVE=1 python -m cua.nih.run_db --db \"$SUPABASE_DATABASE_URL\" --run-id my-run --capture-content . See Conclusion Update and cua/README.md. See Supabase setup and Team env sharing. See Developer reference for schema, agent I/O, and API docs. ",
+    "url": "/guides/#cua--nih-grant-proposal-step-3",
+    
+    "relUrl": "/guides/#cua--nih-grant-proposal-step-3"
+  },"111": {
+    "doc": "Guides",
+    "title": "Showcase (June 6, 2026)",
+    "content": "| Audience | Start here | . | Judges / quick tour | Home → Output examples (Steps 1–3 screenshots) → Dashboard demo tour → Pipeline modes FAQ → run make dashboard locally | . | Live demo | Debugging — safe demo checklist — Step 2 for rankings; expand Audit &amp; provenance for trace; finish on Grant Proposal (tab 3) | . | Architecture | Workflow · Design &amp; engineering | . | Team | Team | . Live UI: cd neurodiscover &amp;&amp; make dashboard — three tabs; use demo mode on stage. Docs site: neurodiscover.github.io (canonical; auto-deploys from docs/ on push to main). Refresh dashboard screenshots after UI changes: . cd neurodiscover make dashboard --no-browser # or running API :5000 + UI :8080 python3 scripts/capture_dashboard_screenshots.py # → Step 2 overview captures .results-shell (centered column) . ",
+    "url": "/guides/#showcase-june-6-2026",
+    
+    "relUrl": "/guides/#showcase-june-6-2026"
+  },"112": {
+    "doc": "Guides",
+    "title": "Site publishing",
+    "content": "How to publish this docs site to https://neurodiscover.github.io — see Site publishing. ",
+    "url": "/guides/#site-publishing",
+    
+    "relUrl": "/guides/#site-publishing"
+  },"113": {
+    "doc": "Guides",
+    "title": "Guides",
+    "content": " ",
+    "url": "/guides/",
+    
+    "relUrl": "/guides/"
+  },"114": {
+    "doc": "Workflow",
+    "title": "Workflow",
+    "content": "Six agents run in order. Each reads prior tables and writes its own — the database is the blackboard. ",
+    "url": "/workflow/",
+    
+    "relUrl": "/workflow/"
+  },"115": {
+    "doc": "Workflow",
+    "title": "Pipeline overview",
+    "content": "① Literature → ② Subgroups → ③ Connections → ④ Evidence score → ⑤ Commercial → ⑥ Conclusions flowchart LR A1[Literature Synthesis] --&gt; A2[Patient Subgroup] A2 --&gt; A3[Treatment Connection] A3 --&gt; A4[Evidence Scoring] A4 --&gt; A5[Commercial Discovery] A5 --&gt; A6[Conclusion Update] A1 --&gt; DB[(evidence)] A2 --&gt; DB A3 --&gt; DB A4 --&gt; DB A5 --&gt; DB A6 --&gt; DB . | # | Agent | Reads | Writes | . | 1 | Literature Synthesis | PubMed, bioRxiv, trials, grants | evidence, subgroup_evidence, scan_state | . | 2 | Patient Subgroup | evidence | subgroups | . | 3 | Treatment Connection | subgroups, evidence | treatment_connections, connection_evidence | . | 4 | Evidence Scoring | connections + evidence | evidence_strength | . | 5 | Commercial Discovery | scored connections (in-memory) | commercial_potential (via orchestrator) | . | 6 | Conclusion Update | scored connections | recommendations | . Step 6 in the dashboard pipeline is formula-based ranking in the orchestrator (no LLM). The cua/ package is the grant-proposal Agent 6 path — it writes an NIH R01 to local files and powers Step 3 — Grant Proposal in the dashboard — see Conclusion Update → CUA package. Agent 1 appends its own agent_outputs rows. Agents 2–6 run in-process; the orchestrator persists SQL writes, logs agent_outputs (step_order 2–6), and commits after each agent so the dashboard run status strip can poll live progress during POST /api/run-discovery. ",
+    "url": "/workflow/#pipeline-overview",
+    
+    "relUrl": "/workflow/#pipeline-overview"
+  },"116": {
+    "doc": "Workflow",
+    "title": "Run modes",
+    "content": "| Mode | Behavior | When to use | . | demo | Subprocess cli.py demo, then agents 2–6; max_papers caps rows for agents 2–6 | Stage demos, offline judging (local SQLite) | . | agents-only | Skip literature pull; log agent 1 trace; agents 2–6 on existing DB evidence | make dashboard on team Supabase; re-score after pull | . | scan | Subprocess cli.py scan (incremental; PubTator skipped); agents 2–6 use all subgroup evidence in DB | Low-cost updates | . | full | In-process literature_agent.run() + optional pull-grants (up to 30 grants); agents 2–6 use all subgroup evidence in DB | Live data refresh | . include_preprints, with_fulltext, and extract_backend apply to full mode (and pull/full literature paths). Scan/demo subprocess calls ignore preprints/fulltext API flags. Orchestrator entry: neurodiscover/orchestrator.py via POST /api/run-discovery or make dashboard. | demo / scan — literature via cli.py subprocess, then agents 2–6 in-process | agents-only — no literature subprocess; agents 2–6 on existing evidence (Supabase dashboard startup) | full — literature_agent.run() (+ optional grants), then agents 2–6 | . ",
+    "url": "/workflow/#run-modes",
+    
+    "relUrl": "/workflow/#run-modes"
+  },"117": {
+    "doc": "Workflow",
+    "title": "Run status",
+    "content": "| Status | Rule | . | Complete | All six agents in trace and ≥1 recommendation — or ≥5 recommendations with partial trace (see run_status.py) | . | Partial | Fewer than six agents and/or no recommendations — UI shows e.g. 3/6 | . | Failed | Uncaught exception in orchestrator | . ",
+    "url": "/workflow/#run-status",
+    
+    "relUrl": "/workflow/#run-status"
+  },"118": {
+    "doc": "Workflow",
+    "title": "Scoring formula",
+    "content": "Used by Agent 6 when writing recommendations: . confidence = evidence_strength × 0.55 + commercial_potential × 0.45 . Agents 4 and 5 compute 0–10 scores in Python; the orchestrator stores 0–100 on treatment_connections (×10). recommendations.confidence uses the stored 0–100 values (displayed as 0–100 in the API). ",
+    "url": "/workflow/#scoring-formula",
+    
+    "relUrl": "/workflow/#scoring-formula"
+  },"119": {
+    "doc": "Workflow",
+    "title": "Related",
+    "content": ". | Inputs — SQL reads and API request bodies | Output examples — JSON responses | Agent I/O — full SQL for developers | . ",
+    "url": "/workflow/#related",
+    
+    "relUrl": "/workflow/#related"
+  },"120": {
+    "doc": "Developer reference",
+    "title": "Developer reference",
+    "content": "Schema, agent I/O, backend SQL, validation, and API docs. Start with Database schema and Agent I/O when changing agents or tables. ",
+    "url": "/developer-reference/",
+    
+    "relUrl": "/developer-reference/"
+  },"121": {
+    "doc": "Developer reference",
+    "title": "Documents",
+    "content": "| Page | Audience | . | Database schema | Everyone — tables, columns, SQLite vs Postgres | . | Agent I/O | Agent authors — reads/writes per agent | . | Backend queries | API — SQL + JSON shapes | . | API endpoints | Route list | . | Person 2 backend | Supabase handoff | . | Dashboard API | Dashboard ↔ API | . | Literature pull | BioMCP, MCP env vars | . | Validation | Extraction QA | . | Supabase | Team shared DB | . | Team env sharing | .env distribution | . | Downstream agents | Agents 2–6 integration notes | . | Debugging | Deploy, API, and pipeline troubleshooting | . See also Design &amp; engineering — modularity, blackboard pattern, and technical proficiency overview. Also see root queries.sql and AGENTS.md in the repo. ",
+    "url": "/developer-reference/#documents",
+    
+    "relUrl": "/developer-reference/#documents"
+  },"122": {
+    "doc": "Home",
+    "title": "NeuroDiscover AI",
+    "content": "Six agents · one evidence store · ranked commercial discovery · grant proposal . |   |   | . | Team | Quorum | . | Track | 02 — Autonomous Research | . | Partner | Pfizer Commercial Development Discovery | . | Code | github.com/kahinimehta/Quorum | . Continuously ingest literature and trials, surface hidden patient subgroups, map subgroup → mechanism → treatment, and rank opportunities by evidence and commercial potential. ",
+    "url": "/#neurodiscover-ai",
+    
+    "relUrl": "/#neurodiscover-ai"
+  },"123": {
+    "doc": "Home",
+    "title": "What problem we solve",
+    "content": "Traditional portfolio review evaluates a small set of opportunities over months, using expert taxonomies that structurally miss: . | Patient subgroups hidden inside a heterogeneous indication | Mechanisms that connect conditions thought to be unrelated | White-space signals that only appear when literature, trials, and funding are synthesized continuously | . NeuroDiscover is an AI-native alternative: six agents share a SQL evidence store, update conclusions as new sources arrive, and output auditable Prioritize / Monitor / Reject tiers. See Problem &amp; significance for full framing. ",
+    "url": "/#what-problem-we-solve",
+    
+    "relUrl": "/#what-problem-we-solve"
+  },"124": {
+    "doc": "Home",
+    "title": "How ranking works",
+    "content": "confidence = evidence_strength × 0.55 + commercial_potential × 0.45 . Scores scale with per-connection evidence count — new literature, trials, or tagged grants move confidence when agents 2–6 rerun after a pull. See Output examples — when confidence changes. | Tier | Rule | . | Prioritize | confidence ≥ 80 | . | Monitor | 65 ≤ confidence &lt; 80 | . | Reject | confidence &lt; 65 | . ",
+    "url": "/#how-ranking-works",
+    
+    "relUrl": "/#how-ranking-works"
+  },"125": {
+    "doc": "Home",
+    "title": "Why this architecture",
+    "content": ". | Hidden subgroups — Heterogeneous indications need subgroup-aware discovery, not one-size-fits-all review. | Evidence as contract — Every claim links to real PMIDs, NCT ids, or grants (no invented ids). | Database blackboard — Agents read/write SQL tables; dashboard and API share one store. | Safe demo — Synthetic patient profiles (A–E) illustrate outputs with no PHI. | Indication-agnostic — Configure disease/condition via CLI or API; demo seed data is illustrative only. | . See Architecture decisions for trade-offs · Design &amp; engineering for modularity and technical patterns. ",
+    "url": "/#why-this-architecture",
+    
+    "relUrl": "/#why-this-architecture"
+  },"126": {
+    "doc": "Home",
+    "title": "Quick start",
+    "content": "Requires Python 3.10, 3.11, or 3.12 on macOS, Linux, or Windows. pip: . git clone https://github.com/kahinimehta/Quorum.git cd Quorum/neurodiscover python3 --version # must be 3.10.x – 3.12.x pip install -r requirements.txt cp .env.example .env make dashboard # same as: python3 cli.py dashboard . conda (empty environment): . git clone https://github.com/kahinimehta/Quorum.git cd Quorum/neurodiscover conda env create -f environment.yml conda activate neurodiscover cp .env.example .env make dashboard . Opens the URL printed by the launcher (UI on 8080, API default 5000 with auto-fallback; URL always includes ?api= so the static server reaches FastAPI). Press Ctrl+C to stop. Three tabs: centered column (max 1400px) — Step 1 configure &amp; run · Step 2 discovery results (KPI strip · cohort, rankings, hypotheses; Audit &amp; provenance collapsed) · Step 3 static grant proposal (graded6 — expanded proposal · collapsed Grant pipeline + Pipeline trace &amp; audit; Jump to nav). Windows: use python cli.py dashboard if make is not installed. SSH / headless: add --no-browser and open the Open: URL from launcher output. Full setup, platform notes, and flags → Run the dashboard · Debugging · Showcase pre-flight . Team live database: Supabase holds 300+ real evidence rows. Set SUPABASE_DATABASE_URL in .env and do not run cli.py build (it truncates all tables). Use scan / pull to add evidence only. ",
+    "url": "/#quick-start",
+    
+    "relUrl": "/#quick-start"
+  },"127": {
+    "doc": "Home",
+    "title": "Repository map",
+    "content": "| Path | Role | . | neurodiscover/agents/ | Six pipeline agents | . | neurodiscover/orchestrator.py | Wires agents 1→6 for API runs | . | neurodiscover/api_server.py | FastAPI backend (:5000) | . | neurodiscover/frontend/index.html | Dashboard UI (:8080) — Steps 1–3 | . | cua/ | Grant-proposal Agent 6 (CLI; dashboard Step 3 — Grant Proposal = static graded6 demo) | . | docs/ | This documentation site | . ",
+    "url": "/#repository-map",
+    
+    "relUrl": "/#repository-map"
+  },"128": {
+    "doc": "Home",
+    "title": "Next steps",
+    "content": ". | Problem &amp; significance — unmet need and track alignment | Workflow — six-agent pipeline | Design &amp; engineering — modularity, blackboard pattern, technical proficiency | Inputs · Output examples — dashboard screenshots (Steps 1–3) | Inputs — pipeline modes FAQ — Demo vs Rescore, incremental vs full, timing, max papers | Dashboard — Step 3 explained — grant tab sections, contract, best-of-N | Team — interdisciplinary roles | Dashboard — demo tour — 3-minute judge walkthrough (Steps 1–3) | Guides — showcase — judge tour + safe demo checklist | Debugging — deploy, API, and pipeline troubleshooting | Run the dashboard — UI walkthrough | . ",
+    "url": "/#next-steps",
+    
+    "relUrl": "/#next-steps"
+  },"129": {
+    "doc": "Home",
+    "title": "Home",
+    "content": " ",
+    "url": "/",
+    
+    "relUrl": "/"
+  },"130": {
+    "doc": "Inputs",
+    "title": "Inputs",
+    "content": "What NeuroDiscover consumes — external evidence sources, API request bodies, and the distilled database columns each agent reads. ",
+    "url": "/input/",
+    
+    "relUrl": "/input/"
+  },"131": {
+    "doc": "Inputs",
+    "title": "Dashboard — Step 1 (Configure &amp; Run)",
+    "content": "The UI maps directly to pipeline inputs: one pipeline mode (segmented control), keyword filter, max papers, pull options (full mode only), and extraction backend. A single Run button uses whichever mode is selected — there is no separate incremental-scan button. Step 1 — centered column (max 1400px); pick a pipeline mode, optional keyword filter, then click the run button (label matches the selected mode). Pipeline modes (Step 1) . | UI mode | API mode | What it does | . | Rescore DB | agents-only | Skip literature pull; run agents 2–6 on evidence already in the database (default on team Supabase). | . | Demo sample | demo | Offline; uses existing rows, no live PubMed pull; caps literature rows for agents 2–6. | . | Incremental scan | scan | Pull new papers/trials only; skip LLM for known source IDs; trace says Incremental scan complete; Recent runs evidence column tagged incremental. | . | Full live pull | full | Live PubMed + trials + optional preprints, full text, and NIH grants; trace says Full live pull complete; evidence column shows papers/trials stored. | . Preprint, full-text, and grant toggles apply only to Full live pull. Recommended workflow . Full live pull → stock the library (first time or big refresh) Incremental scan → add new papers cheaply (ongoing) Rescore DB → rerun rankings on same evidence (no PubMed) Demo sample → stage / laptop demo only (small cap, no pull) . | Situation | Use | . | Empty or thin DB | Full live pull (optionally preprints + grants) | . | Team DB already has 300+ rows | Incremental scan for updates; Rescore to refresh rankings | . | On stage / first laptop open | Demo sample (pre-run make dashboard) | . | Never on team Supabase | cli.py build — it truncates all tables | . make dashboard picks defaults for you: local SQLite → demo max_papers=10; Supabase → rescore with no cap (max_papers=0 = full corpus). Demo vs Rescore (no live PubMed) . Both modes skip live literature pull. Agent 1 only logs a trace row; agents 2–6 compute subgroups, connections, scores, and recommendations. |   | Demo sample | Rescore DB | . | API mode | demo | agents-only | . | Adds new papers? | No | No | . | Default max_papers | 10 (launcher + UI) | 0 (= all rows on Supabase) | . | Typical DB | Local seed (~43 rows) | Team Supabase (~300+) | . | Agent 1 trace | “Demo mode: using X of Y rows…” | “Agents-only: using X of Y rows…” | . Mental models: Demo = quick tour with a small sample. Rescore = re-sort the full catalog without buying new books. What max_papers does . Max papers caps literature rows passed to agents 2–6. Trials and grants are not capped — all tagged trial/grant rows still count. Only rows with subgroup tags affect scoring; untagged papers sit in the DB but do not move confidence. | Mode | How the cap applies | . | Demo | Always uses your max_papers (minimum 10 in the API) | . | Rescore | max_papers &gt; 0 caps literature; 0 or UI ≥ 500 → no cap (full DB) | . | Incremental / Full | Caps the pull size; agents 2–6 then run on the full DB after ingest | . Why Demo feels “stuck” when you raise max: On the local seed DB there are only ~11 tagged literature rows. Changing 10 → 50 → 150 often changes nothing — you already hit the ceiling. Rescore on Supabase has hundreds of papers, so the same knob clearly changes rankings. Demo (10) ≈ Rescore (10) only on the same database. Demo on a laptop vs Rescore (10) on Supabase is not the same — different pools of papers. Incremental scan vs full live pull . Both hit live APIs (PubMed, trials via BioMCP), then run all six agents. Neither is offline like Demo/Rescore. |   | Incremental scan | Full live pull | . | API mode | scan | full | . | Intent | Add what’s new cheaply | Backfill / refresh the corpus | . | Known source_id in DB? | Skip LLM re-extraction | Same — skip duplicates | . | Date bias | Uses scan_state.last_scan_at to narrow pulls | Broader since-year pull | . | Preprints / grants UI | Off (scan path) | Optional toggles | . | Trace label | Incremental scan complete | Full live pull complete | . Incremental: For each search hit, already stored → touch last_scanned_at and skip; new → one LLM extraction → insert. Full: Same merge behavior, plus optional preprints, full-text sections, and NIH grants — more network and extraction work, so full usually takes longer at the same max_papers. Stage safety: Incremental and full call live PubMed and may run LLM extraction. Pre-run before presenting; use Demo or Rescore on stage. See Debugging — safe demo checklist. Does full clear the database? . No. Full live pull (and incremental scan) merge into existing data: . | Duplicate source_type + source_id → skip insert, no second copy | New ids → INSERT OR IGNORE / ON CONFLICT DO NOTHING | . Agents 2–6 may update scores, connections, and recommendations for the new run_id, but they do not bulk-delete evidence. | Command | Clears DB? | . | cli.py build | Yes — truncates all tables, reloads seed | . | make dashboard --fresh (local) | Yes — deletes and rebuilds local neurodiscover.db | . | Full / incremental / demo / rescore | No | . How long do runs take? (ballpark) . Runtime depends on how many papers are new (not just max_papers) and EXTRACT_BACKEND (nebius vs none). Incremental scan, max 150, mature Supabase (typical: 150 searched · +3 new · 147 skipped): . | Phase | Rough time | . | Search + fetch ~150 sources | ~1–3 min | . | LLM on ~3 new papers | ~30 s–2 min | . | Agents 2–6 | ~30 s–2 min | . | Total | ~2–7 min | . Same settings, empty DB (~150 all new): literature LLM dominates — often ~12–35 min. Full live pull @ 150 with preprints + grants + full text: often ~1.5×–3× longer than incremental on a mature DB; 30–60+ min if many items are new. Watch Step 1 literature progress: Processing 45/150 sources (2 new, 43 skipped)… — high skipped means a fast finish. ",
+    "url": "/input/#dashboard--step-1-configure--run",
+    
+    "relUrl": "/input/#dashboard--step-1-configure--run"
+  },"132": {
+    "doc": "Inputs",
+    "title": "External evidence sources",
+    "content": "Agent 1 (Literature Synthesis) pulls from public APIs via BioMCP and optional MCP servers: . | Source | source_type | Example id | Tooling | . | PubMed | literature | PMID:38234567 | BioMCP / E-utilities | . | bioRxiv preprints | literature | DOI | bioRxiv MCP | . | ClinicalTrials.gov | trial | NCT01234567 | BioMCP | . | NIH RePORTER | grant | project number | cli.py pull-grants / full-mode pull_grants | . Grant rows infer subgroup, mechanism, and treatment from project title keywords (GBA, LRRK2, alpha-synuclein, etc.) so they can enter agents 2–6. Existing grants with null subgroup are backfilled on each grant pull. Never invent PMIDs, DOIs, or NCT ids. Seed data uses DEMO-* placeholders for offline demo only. Live pulls must use ids returned by BioMCP. Literature pull CLI . cd neurodiscover python3 cli.py pull --disease \"your condition\" --max 150 python3 cli.py pull --max 50 --include-preprints 20 python3 cli.py pull --query \"GBA GCase lysosomal\" --gene GBA python3 cli.py pull-grants --limit 30 python3 cli.py scan --max 5 # incremental; skips LLM for known ids . Extraction backend . Set EXTRACT_BACKEND=nebius|ollama|none in .env for structured LLM extraction of subgroup, mechanism, treatment, key_result, and evidence_snippet from abstracts. ",
+    "url": "/input/#external-evidence-sources",
+    
+    "relUrl": "/input/#external-evidence-sources"
+  },"133": {
+    "doc": "Inputs",
+    "title": "POST /api/run-discovery (pipeline trigger)",
+    "content": "The form in Step 1 — Configure &amp; Run (above) posts the same body the API accepts: . { \"mode\": \"demo\", \"run_id\": \"f799fbe8\", \"query\": null, \"max_papers\": 150, \"disease\": \"Parkinson's\", \"include_preprints\": 0, \"with_fulltext\": false, \"extract_backend\": null, \"pull_grants\": true } . | Field | Values | Meaning | . | mode | demo | scan | full | agents-only | Offline seed / incremental scan / live pull / downstream-only on existing evidence | . | run_id | string (optional) | Client-generated id (8 chars); UI sends this so the run status strip and agent_outputs share one trace from the start. Full mode passes it to literature pull. | . | max_papers | 10–500 (API validated; agents-only may use 0 = all rows) | Demo: caps literature for agents 2–6. Rescore: cap if &gt; 0; 0 or UI ≥ 500 = full DB. Scan/full: caps pull size; agents 2–6 use full DB after ingest. See What max papers does. | . | query | string or null | Optional keyword filter passed to BioMCP | . | disease | string | Literature anchor; dashboard default Parkinson’s (API default \"Parkinson disease\" if omitted) | . | include_preprints | integer | bioRxiv cap; used in full mode | . | with_fulltext | boolean | OA full-text sections; full / pull paths | . | extract_backend | nebius | ollama | none or null | Override EXTRACT_BACKEND in .env | . | pull_grants | boolean | Full mode only: run NIH RePORTER pull (≤30 grants, default PD-focused query if unset) | . | wait | boolean | default false; if true, block until pipeline completes and return full payload (recommendations, agent_outputs, runStats, synthetic_cohort) | . ",
+    "url": "/input/#post-apirun-discovery-pipeline-trigger",
+    
+    "relUrl": "/input/#post-apirun-discovery-pipeline-trigger"
+  },"134": {
+    "doc": "Inputs",
+    "title": "Evidence row (Agent 1 output → Agent 2+ input)",
+    "content": "Each row in the evidence table is a distilled finding — not raw API JSON. Required on live pull . | Column | Example | . | source_type | literature | . | source_id | PMID:38234567 | . Core discovery fields (literature) . | Column | Example | . | title | GCase activity and lysosomal dysfunction in GBA-associated Parkinson’s | . | year | 2023 | . | subgroup | GBA-mutation PD | . | mechanism | lysosomal dysfunction | . | treatment | GCase activation | . | key_result | Reduced GCase activity correlates with faster progression… | . | evidence_snippet | GCase enhancement restored lysosomal function. | . Access metadata . | access_type | access_status | Meaning | . | published_oa | open | OA full text available | . | published_paywalled | restricted | Abstract/metadata only | . | preprint | abstract_only | bioRxiv preprint | . Demo seed example . From seed_data.json (placeholder ids — not for live citation): . { \"source_type\": \"literature\", \"source_id\": \"DEMO-PMID-001\", \"title\": \"GCase activity and lysosomal dysfunction in GBA-associated Parkinson's\", \"year\": 2023, \"subgroup\": \"GBA-mutation PD\", \"mechanism\": \"lysosomal dysfunction\", \"treatment\": \"GCase activation\", \"key_result\": \"Reduced GCase activity correlates with faster progression in GBA carriers.\", \"study_type\": \"preclinical + cohort\", \"sample_size\": 120 } . Literature extraction prefers consistent subgroup names when the evidence supports them. Demo seed uses five names in seed_data.json (e.g. GBA-mutation PD, LRRK2 PD, Rapid motor progressors) — exact match enables auto-linking via subgroup_evidence. ",
+    "url": "/input/#evidence-row-agent-1-output--agent-2-input",
+    
+    "relUrl": "/input/#evidence-row-agent-1-output--agent-2-input"
+  },"135": {
+    "doc": "Inputs",
+    "title": "Per-agent SQL reads",
+    "content": "Downstream agents never read raw BioMCP blobs — only distilled columns. Agent 2 — Patient Subgroup . SELECT evidence_id, subgroup, mechanism, treatment, key_result, study_type, sample_size FROM evidence WHERE subgroup IS NOT NULL; . Agent 3 — Treatment Connection . SELECT s.subgroup_id, s.name, e.mechanism, e.treatment, e.evidence_id FROM evidence e JOIN subgroups s ON s.name = e.subgroup WHERE e.mechanism IS NOT NULL AND e.treatment IS NOT NULL; . Agent 4 — Evidence Scoring . In-memory connections from Agent 3 plus evidence rows matching each connection’s subgroup + mechanism + treatment. Scoring uses per-connection evidence_count (continuous) and source types — not study_type / sample_size directly. Reference SQL (post-persistence inspection): . SELECT tc.connection_id, e.source_type, e.study_type, e.sample_size, e.access_status, e.key_result FROM treatment_connections tc JOIN connection_evidence ce ON ce.connection_id = tc.connection_id JOIN evidence e ON e.evidence_id = ce.evidence_id; . Agent 5 — Commercial Discovery . Reads in-memory scored connections from Agent 4. Heuristic commercial scoring in commercial_discovery_agent.py (no Tavily). Grants are ingested separately via pull-grants / full-mode pull_grants. Agent 6 — Conclusion Update . SELECT tc.connection_id, s.name AS subgroup, tc.treatment, tc.evidence_strength, tc.commercial_potential FROM treatment_connections tc JOIN subgroups s ON s.subgroup_id = tc.subgroup_id WHERE tc.evidence_strength IS NOT NULL AND tc.commercial_potential IS NOT NULL; . ",
+    "url": "/input/#per-agent-sql-reads",
+    
+    "relUrl": "/input/#per-agent-sql-reads"
+  },"136": {
+    "doc": "Inputs",
+    "title": "Shared run_id",
+    "content": "All six agents append to agent_outputs with the same run_id for one pipeline run: . INSERT INTO agent_outputs (run_id, agent_name, step_order, summary, payload) VALUES (?, ?, ?, ?, ?); . See Agent I/O for full SQL and payload shapes. ",
+    "url": "/input/#shared-run_id",
+    
+    "relUrl": "/input/#shared-run_id"
+  },"137": {
+    "doc": "Literature pull",
+    "title": "Literature Pull — Two-Stage MCP Strategy",
+    "content": "Owner: Person 3/4 (Ayelet) Code: ingestion/published_pull.py, ingestion/biorxiv_pull.py, agents/fulltext.py . ",
+    "url": "/developer-reference/literature-pull/#literature-pull--two-stage-mcp-strategy",
+    
+    "relUrl": "/developer-reference/literature-pull/#literature-pull--two-stage-mcp-strategy"
+  },"138": {
+    "doc": "Literature pull",
+    "title": "Overview",
+    "content": "The Literature Synthesis Agent uses a two-stage pull: . | Stage | Source | Default | Full-text chain | . | 1 — Published | PubMed (E-utilities or MCP) | --max 150 | NCBI PMC XML → Europe PMC → Unpaywall → published_paywalled | . | 2 — Preprints | bioRxiv API (or MCP) | --include-preprints N | JATS XML always; access_type=preprint | . Clinical trials still come from BioMCP (trial search) in the same run. ",
+    "url": "/developer-reference/literature-pull/#overview",
+    
+    "relUrl": "/developer-reference/literature-pull/#overview"
+  },"139": {
+    "doc": "Literature pull",
+    "title": "CLI",
+    "content": "cd neurodiscover python3 cli.py build python3 cli.py validate # Stage 1 only (published papers, default max=150) EXTRACT_BACKEND=none python3 cli.py pull --max 5 --no-pubtator --no-validate # With OA section excerpts python3 cli.py pull --max 10 --with-fulltext --no-pubtator # Stage 1 + Stage 2 preprints python3 cli.py pull --max 50 --include-preprints 20 --no-pubtator . ",
+    "url": "/developer-reference/literature-pull/#cli",
+    
+    "relUrl": "/developer-reference/literature-pull/#cli"
+  },"140": {
+    "doc": "Literature pull",
+    "title": "MCP wiring (optional)",
+    "content": "Set env vars to prefer MCP subprocesses over direct APIs: . | Env var | Purpose | . | PUBMED_MCP_COMMAND | Shell command for PubMed search MCP | . | BIORXIV_MCP_COMMAND | Shell command for bioRxiv search MCP | . | UNPAYWALL_EMAIL | Email for Unpaywall OA lookup on paywalled DOIs | . Expected MCP interface (implemented in ingestion/mcp_clients.py): . $PUBMED_MCP_COMMAND search --json '{\"query\":\"Parkinson GBA\",\"max\":10,\"since_year\":2020}' # stdout: JSON list of articles OR {\"results\":[...]} . If the command is unset or fails, fallbacks run automatically: . | PubMed: NCBI E-utilities (esearch + efetch), then BioMCP if empty | bioRxiv: https://api.biorxiv.org/details/biorxiv/{start}/{end}/{cursor} with client-side keyword filter | Unpaywall: https://api.unpaywall.org/v2/{doi}?email=... | . Wiring real MCP servers later . | Clone/install your team’s PubMed/bioRxiv MCP repos locally. | Wrap each in a thin shell script that accepts search --json '&lt;payload&gt;' and prints JSON hits. | Set PUBMED_MCP_COMMAND / BIORXIV_MCP_COMMAND in .env. | No code changes required unless the MCP uses a different CLI interface — then adjust ingestion/mcp_clients.py. | . CI does not require MCP repos; direct API fallbacks are the default path. ",
+    "url": "/developer-reference/literature-pull/#mcp-wiring-optional",
+    
+    "relUrl": "/developer-reference/literature-pull/#mcp-wiring-optional"
+  },"141": {
+    "doc": "Literature pull",
+    "title": "Schema (access_type / access_status)",
+    "content": "| access_type | access_status (backend) | Meaning | . | published_oa | open | Full text retrieved (PMC/EPMC/Unpaywall) | . | published_paywalled | restricted | Metadata/abstract only | . | preprint | abstract_only | bioRxiv preprint | . | error | error | Lookup failed | . | unknown | unknown | No classification | . Legacy values open / restricted are mapped in code to published_oa / published_paywalled. New columns: is_preprint, publication_year. Migration: migrations/002_evidence_mcp_metadata.sql. ",
+    "url": "/developer-reference/literature-pull/#schema-access_type--access_status",
+    
+    "relUrl": "/developer-reference/literature-pull/#schema-access_type--access_status"
+  },"142": {
+    "doc": "Literature pull",
+    "title": "Title deduplication",
+    "content": "Preprints whose normalized title matches a published paper from stage 1 are skipped. Normalization: lowercase, strip punctuation, collapse whitespace (ingestion/biorxiv_pull.py). ",
+    "url": "/developer-reference/literature-pull/#title-deduplication",
+    
+    "relUrl": "/developer-reference/literature-pull/#title-deduplication"
+  },"143": {
+    "doc": "Literature pull",
+    "title": "Testing",
+    "content": "# Europe PMC section extract on known OA PMID python3 -c \" from agents.fulltext import resolve_published_access r = resolve_published_access('41989783', with_fulltext=True) print(r['access_type'], bool(r.get('methods_text') or r.get('results_text'))) \" # Title dedupe unit check python3 -c \" from ingestion.biorxiv_pull import normalize_title, title_is_duplicate pub = {normalize_title('Alpha-Synuclein in Parkinson Disease.')} print(title_is_duplicate('Alpha Synuclein in Parkinson Disease', pub)) \" . ",
+    "url": "/developer-reference/literature-pull/#testing",
+    
+    "relUrl": "/developer-reference/literature-pull/#testing"
+  },"144": {
+    "doc": "Literature pull",
+    "title": "Literature pull",
+    "content": " ",
+    "url": "/developer-reference/literature-pull/",
+    
+    "relUrl": "/developer-reference/literature-pull/"
+  },"145": {
+    "doc": "Literature Synthesis",
+    "title": "Agent 1 — Literature Synthesis",
+    "content": "Module: neurodiscover/agents/literature_agent.py Owner: Ayelet Peres Step order: 1 . ",
+    "url": "/workflow/literature-synthesis/#agent-1--literature-synthesis",
+    
+    "relUrl": "/workflow/literature-synthesis/#agent-1--literature-synthesis"
+  },"146": {
+    "doc": "Literature Synthesis",
+    "title": "Role",
+    "content": "Pull manuscripts and clinical trials for a configured disease or condition, extract structured findings via LLM, and write distilled rows to the evidence table. Auto-link evidence to seed subgroups when names match exactly. ",
+    "url": "/workflow/literature-synthesis/#role",
+    
+    "relUrl": "/workflow/literature-synthesis/#role"
+  },"147": {
+    "doc": "Literature Synthesis",
+    "title": "External inputs",
+    "content": "| Source | Tool | source_type | . | PubMed | BioMCP | literature | . | bioRxiv | bioRxiv MCP (optional) | literature | . | ClinicalTrials.gov | BioMCP | trial | . | NIH RePORTER | pull-grants / full-mode grants step | grant | . Grant rows infer subgroup, mechanism, and treatment from project title keywords so they can enter agents 2–6 (existing null grants backfilled on each grant pull). ",
+    "url": "/workflow/literature-synthesis/#external-inputs",
+    
+    "relUrl": "/workflow/literature-synthesis/#external-inputs"
+  },"148": {
+    "doc": "Literature Synthesis",
+    "title": "Pipeline steps",
+    "content": ". | PULL — search BioMCP for disease + optional keyword/gene filter | FETCH — abstract and metadata per hit (two-step; access flags set) | EXTRACT — Nebius/Ollama structured extraction (EXTRACT_BACKEND) | WRITE — INSERT into evidence (UNIQUE(source_type, source_id) dedups) | LINK — subgroup_evidence when evidence.subgroup matches subgroups.name | TRACE — log to agent_outputs; update scan_state on incremental scans | . Dashboard Full live pull stocks the corpus; Incremental scan adds new rows cheaply (skips LLM for known source_ids). Neither mode clears existing evidence — only cli.py build truncates. See Inputs — pipeline modes FAQ. ",
+    "url": "/workflow/literature-synthesis/#pipeline-steps",
+    
+    "relUrl": "/workflow/literature-synthesis/#pipeline-steps"
+  },"149": {
+    "doc": "Literature Synthesis",
+    "title": "Writes",
+    "content": "| Table | Content | . | evidence | One row per source with subgroup, mechanism, treatment, key_result, access metadata | . | subgroup_evidence | Many-to-many links to seed subgroups | . | scan_state | Singleton: last scan time, last run_id | . | agent_outputs | Trace row with pull stats | . ",
+    "url": "/workflow/literature-synthesis/#writes",
+    
+    "relUrl": "/workflow/literature-synthesis/#writes"
+  },"150": {
+    "doc": "Literature Synthesis",
+    "title": "Key columns on evidence",
+    "content": "source_type, source_id, title, year, subgroup, mechanism, treatment, key_result, evidence_snippet, access_type, access_status, doi, methods_text, results_text, discussion_text . ",
+    "url": "/workflow/literature-synthesis/#key-columns-on-evidence",
+    
+    "relUrl": "/workflow/literature-synthesis/#key-columns-on-evidence"
+  },"151": {
+    "doc": "Literature Synthesis",
+    "title": "CLI",
+    "content": "python3 cli.py pull --disease \"your condition\" --max 150 python3 cli.py pull --max 50 --include-preprints 20 python3 cli.py pull --query \"GBA GCase lysosomal\" --gene GBA python3 cli.py scan --max 5 # incremental python3 cli.py demo # offline; no API . ",
+    "url": "/workflow/literature-synthesis/#cli",
+    
+    "relUrl": "/workflow/literature-synthesis/#cli"
+  },"152": {
+    "doc": "Literature Synthesis",
+    "title": "Example trace payload",
+    "content": "{ \"new_evidence\": 3, \"skipped_duplicates\": 7, \"since_year\": 2024, \"incremental\": true } . ",
+    "url": "/workflow/literature-synthesis/#example-trace-payload",
+    
+    "relUrl": "/workflow/literature-synthesis/#example-trace-payload"
+  },"153": {
+    "doc": "Literature Synthesis",
+    "title": "Validation",
+    "content": "After pull, optional consistency checks and PubTator grounding run automatically. See Validation. ",
+    "url": "/workflow/literature-synthesis/#validation",
+    
+    "relUrl": "/workflow/literature-synthesis/#validation"
+  },"154": {
+    "doc": "Literature Synthesis",
+    "title": "Literature Synthesis",
+    "content": " ",
+    "url": "/workflow/literature-synthesis/",
+    
+    "relUrl": "/workflow/literature-synthesis/"
+  },"155": {
+    "doc": "Output examples",
+    "title": "Output examples",
+    "content": "What NeuroDiscover produces — ranked recommendations, agent trace, synthetic patients, and API response shapes. ",
+    "url": "/output/",
+    
+    "relUrl": "/output/"
+  },"156": {
+    "doc": "Output examples",
+    "title": "Dashboard — Step 2 (Discovery Results)",
+    "content": "After a run completes, Step 2 shows pipeline outputs: ideal candidate profiles, ranked treatments, and hypotheses. Audit &amp; provenance (agent trace + evidence preview) is collapsed by default — expand it to inspect this run’s run_id and source links. Layout top-to-bottom: . | KPI strip — papers · trials · grants · subgroups · connections (database totals, or this run after a pipeline). | Pipeline complete badge beside the Step 2 title when a run finishes successfully. | Subtitle: Cohort, ranked outputs, &amp; hypotheses. | Three panels — Ideal candidate profiles · Ranked outputs · Research hypotheses (with confidence-by-treatment strip). | Discovery pipeline — flow diagram (inputs → six agents → outputs). | Audit &amp; provenance — collapsed by default; expand for agent run trace + paginated evidence preview. | . Step 2 — centered results shell (max 1400px, 1.5rem side padding) with KPI strip above title; ideal candidate profiles and ranked outputs cap at research hypotheses body height (borders wrap content; scroll when longer); ranked bars show treatment · subgroup; discovery pipeline and audit &amp; provenance below. ",
+    "url": "/output/#dashboard--step-2-discovery-results",
+    
+    "relUrl": "/output/#dashboard--step-2-discovery-results"
+  },"157": {
+    "doc": "Output examples",
+    "title": "Dashboard — Step 3 (Grant Proposal)",
+    "content": "Step 3 is separate from pipeline rankings and not run-scoped. It loads bundled graded6 via GET /api/cua/demo and inlines /cua-demo/graded6.html. The proposal stays expanded (NIH aims + PubMed ID citations); Grant pipeline is a separate collapsed block with the agent-flow diagram; Pipeline trace &amp; audit is one collapsed group for contract, booster, audit, and ingestion prose. Hero KPIs and Jump to are unchanged across Step 2 runs. Step 3 — centered column (max 1400px); hero KPIs (corpus · verified papers · citations · Critic F1/F2/F3), report toolbar 17/21 obligations satisfied, expanded proposal, collapsed Grant pipeline + Pipeline trace &amp; audit. Verified papers is not the full database — it is ingestion’s top_k (60 in graded6) after clustering and relevance ranking. The full corpus (400) still backs citation integrity. See Dashboard — Corpus vs verified papers. | Jump to | Layout | Content | . | Proposal | Always visible (first in report) | NIH R01 proposal — significance, innovation, three aims; PubMed ID / NCT / Grant citation links | . | Grant pipeline | Collapsed block | Interactive agent-flow diagram + Open full report link | . | Supporting details | One collapsed group | Contract · dropped args · revise rounds · booster · A/B outcomes · raw trace · audit · ingestion | . To generate a new proposal from your database, run python -m cua.nih.run_db (see Conclusion Update → CUA). Section-by-section tour (contract, best-of-N, data loop, audit, …): Dashboard — Step 3 report structure. ",
+    "url": "/output/#dashboard--step-3-grant-proposal",
+    
+    "relUrl": "/output/#dashboard--step-3-grant-proposal"
+  },"158": {
+    "doc": "Output examples",
+    "title": "POST /api/run-discovery response",
+    "content": "Full pipeline response (demo mode, abbreviated): . { \"run_id\": \"a1b2c3d4\", \"recommendations\": [ { \"subgroup\": \"GBA-mutation PD\", \"treatment\": \"GCase activation\", \"mechanism\": \"lysosomal dysfunction\", \"confidence\": 82.5, \"tier\": \"Prioritize\", \"rationale\": \"Strong preclinical and Phase 2 signal for GCase chaperones in GBA carriers.\" } ], \"agent_outputs\": [ { \"agentName\": \"Literature Synthesis Agent\", \"stepOrder\": 1, \"summary\": \"Processed 5 literature rows (demo mode).\", \"createdAt\": \"2026-06-01T16:00:00Z\" } ], \"synthetic_cohort\": [ { \"patient_id\": \"Patient Cluster A\", \"patient_letter\": \"A\", \"subgroup\": \"GBA-mutation PD\", \"subgroup_color\": \"#2563eb\", \"synthetic_age\": 68, \"synthetic_sex\": \"M\", \"key_feature\": \"GBA1 variant carriers\", \"top_opportunity\": \"GCase activation\", \"mechanism\": \"lysosomal dysfunction\", \"confidence\": 82.5, \"is_synthetic\": true, \"phi_free\": true } ], \"runStats\": { \"mode\": \"demo\", \"modeLabel\": \"Demo sample\", \"maxPapersRequested\": 10, \"processed\": { \"literature\": 5, \"trial\": 0, \"grant\": 0, \"total\": 5 }, \"databaseTotals\": { \"literature\": 228, \"trial\": 39, \"grant\": 40, \"total\": 307 }, \"added\": { \"literature\": 0, \"trial\": 0, \"grant\": 0, \"total\": 0 } } } . steps is an alias of agent_outputs. ",
+    "url": "/output/#post-apirun-discovery-response",
+    
+    "relUrl": "/output/#post-apirun-discovery-response"
+  },"159": {
+    "doc": "Output examples",
+    "title": "Recommendations (Agent 6)",
+    "content": ". Ranked treatments with confidence bars and Prioritize / Monitor / Reject tiers. Treatment labels . Canonical treatment slugs in evidence and recommendations map to dashboard copy via treatment_labels.py (backend rationales) and the Step 2 UI. | DB slug | Dashboard label | Meaning | . | GCase activation | GCase activation | Lysosomal GCase chaperone/activator for GBA-mutation PD | . | LRRK2 inhibition | LRRK2 inhibition | Kinase-pathway LRRK2 inhibitor for LRRK2 PD | . | clearance therapy | clearance therapy | Alpha-synuclein clearance/immunotherapy for high-seeding PD | . | microglial modulation | microglial modulation | Anti-inflammatory microglial target for inflammation-high PD | . | combination strategy | Combination neuroprotection | Rapid motor progressors (fast UPDRS decline): literature proposes stacking multiple neuroprotective agents—symptomatic plus disease-modifying—because no single therapy is established for this trajectory. Evidence is cohort-level and early; typically Monitor tier. | . { \"recommendations\": [ { \"subgroup\": \"GBA-mutation PD\", \"treatment\": \"GCase activation\", \"mechanism\": \"lysosomal dysfunction\", \"confidence\": 82.5, \"tier\": \"Prioritize\", \"rationale\": \"Multiple literature and trial sources; strong mechanism alignment.\" }, { \"subgroup\": \"LRRK2 PD\", \"treatment\": \"LRRK2 inhibition\", \"confidence\": 71.2, \"tier\": \"Monitor\", \"rationale\": \"Phase 2 ongoing; evidence strength moderate.\" }, { \"subgroup\": \"Rapid motor progressors\", \"treatment\": \"combination strategy\", \"mechanism\": \"neuroprotection\", \"confidence\": 77.8, \"tier\": \"Monitor\", \"rationale\": \"Rapid motor progressors → Combination neuroprotection via neuroprotection. Rapid motor progressors show faster UPDRS decline than typical PD. Literature proposes combining neuroprotective agents rather than betting on one monotherapy, but combo regimens remain unproven in this subgroup. Confidence 77.8 (Monitor).\" } ] } . Scoring (Steps 1–2) . confidence = evidence_strength × 0.55 + commercial_potential × 0.45 . | Field | Minimum | Maximum | . | evidence_strength (Agent 4, stored) | 0 | 100 | . | commercial_potential (Agent 5, stored) | 0 | 100 | . | confidence (Agent 6, displayed) | 0 | 100 | . Agents 4–5 compute 0–10 heuristics in code; the orchestrator scales ×10 before writing the DB columns above. | Tier | Condition | . | Prioritize | confidence ≥ 80 | . | Monitor | 65 ≤ confidence &lt; 80 | . | Reject | confidence &lt; 65 | . Not the same as Tab 3 Critic scores. Grant Proposal F1 / F2 / F3 use a 1–9 NIH Critic scale (minimum 1, maximum 9). See Dashboard — Critic score scale. When confidence changes . Scores update every pipeline run (agents 2–6 recompute from the full evidence corpus with subgroup IS NOT NULL). Confidence moves when: . | New literature/trial rows are stored with subgroup, mechanism, and treatment filled (check literature step: Stored N new evidence). | Those rows attach to an existing connection (increase evidence_count) or create a new connection. | Grant pulls tag rows into subgroups (title keyword inference + backfill on each pull). | . Confidence may stay flat when Stored 0 new, when new rows lack extraction fields, or when Rescore runs on the same corpus without new scored rows. Demo and Rescore cap literature only — trials always count. Results charts prefer this run’s recommendations over global connection totals. Recent runs Mode column uses human labels (Incremental scan, Full live pull, …). Evidence column examples: . | Mode | Example evidence note | . | Incremental scan | 150 searched · +3 new · 147 skipped · incremental | . | Full live pull | 150 papers · 5 trials · +12 stored · 138 skipped | . | Rescore DB | 182 rows rescored (no pull) | . | Demo sample | 10 papers (demo sample) | . Only scored rows (with subgroup tags) affect confidence — see Inputs. ",
+    "url": "/output/#recommendations-agent-6",
+    
+    "relUrl": "/output/#recommendations-agent-6"
+  },"160": {
+    "doc": "Output examples",
+    "title": "Agent trace",
+    "content": ". Expand Audit &amp; provenance on Step 2 — agent run trace (shared run_id) and paginated evidence preview with source links. Every run logs rows in agent_outputs. Literature logs mode-specific summaries and live progress commits during scan/pull: . { \"runId\": \"a1b2c3d4\", \"steps\": [ { \"agentName\": \"Literature Synthesis Agent\", \"stepOrder\": 0, \"summary\": \"Starting incremental scan for Parkinson's…\", \"payload\": { \"pipeline_mode\": \"scan\", \"incremental\": true, \"progress\": 0, \"total\": 150 } }, { \"agentName\": \"Literature Synthesis Agent\", \"stepOrder\": 2, \"summary\": \"Incremental scan complete: stored 3 new evidence rows (147 existing skipped, 0 rejected).\", \"payload\": { \"pipeline_mode\": \"scan\", \"new_evidence\": 3, \"skipped_duplicates\": 147 } }, { \"agentName\": \"Patient Subgroup Agent\", \"stepOrder\": 2, \"summary\": \"Identified 5 subgroups from 182 evidence rows.\", \"payload\": { \"count\": 5 } } ] } . Full live pull uses Full live pull complete: stored N new… and \"pipeline_mode\": \"full\" in payloads. GET /api/runs . { \"runs\": [ { \"runId\": \"8aaa41ec\", \"mode\": \"scan\", \"modeLabel\": \"Incremental scan\", \"evidenceNote\": \"150 searched · +3 new · 147 skipped · incremental\", \"status\": \"Complete\", \"statusDetail\": \"All 6 agents finished · 6 recommendation(s)\" }, { \"runId\": \"c88de439\", \"mode\": \"full\", \"modeLabel\": \"Full live pull\", \"evidenceNote\": \"150 papers · 5 trials · +12 stored · 138 skipped\", \"status\": \"Complete\", \"statusDetail\": \"All 6 agents finished · 6 recommendation(s)\" } ] } . Run status . | Status | Meaning | . | Complete | Six agents in trace and ≥1 recommendation (or ≥5 recommendations per run_status.py) | . | Partial | Stopped early — dashboard shows e.g. 3/6 agents, not ?/6 | . | Failed | Exception during orchestration | . ",
+    "url": "/output/#agent-trace",
+    
+    "relUrl": "/output/#agent-trace"
+  },"161": {
+    "doc": "Output examples",
+    "title": "Ideal candidate profiles (Patient Cluster A–E)",
+    "content": ". Illustrative candidate profiles (Patient Cluster A–E) — synthetic only, no PHI. Generated per run_id from recommendations + subgroups. Not stored in the database. Every profile is labeled synthetic / no PHI. { \"run_id\": \"abc123\", \"synthetic_cohort\": [ { \"patient_id\": \"Patient Cluster A\", \"subgroup\": \"GBA-mutation PD\", \"top_opportunity\": \"GCase activation\", \"mechanism\": \"lysosomal dysfunction\", \"confidence\": 82.5, \"is_synthetic\": true, \"phi_free\": true } ] } . Route: GET /api/synthetic-cohort?run_id=abc123 . ",
+    "url": "/output/#ideal-candidate-profiles-patient-cluster-ae",
+    
+    "relUrl": "/output/#ideal-candidate-profiles-patient-cluster-ae"
+  },"162": {
+    "doc": "Output examples",
+    "title": "Database tables written",
+    "content": "| Agent | Tables / columns | . | 1 Literature | evidence, subgroup_evidence, scan_state, agent_outputs | . | 2 Subgroups | subgroups, agent_outputs | . | 3 Connections | treatment_connections, connection_evidence, agent_outputs | . | 4 Evidence | treatment_connections.evidence_strength, agent_outputs | . | 5 Commercial | treatment_connections.commercial_potential, agent_outputs | . | 6 Conclusion | recommendations, agent_outputs | . Literature agent payload example . { \"new_evidence\": 3, \"skipped_duplicates\": 7, \"touched_existing\": 7, \"rejected_no_id\": 1, \"since_year\": 2024, \"incremental\": true } . ",
+    "url": "/output/#database-tables-written",
+    
+    "relUrl": "/output/#database-tables-written"
+  },"163": {
+    "doc": "Output examples",
+    "title": "GET /api/stats",
+    "content": "Database overview for the Step 2 KPI strip (before a run switches subtitles to this run): . { \"literature\": 228, \"trial\": 39, \"grant\": 40, \"subgroups\": 5, \"connections\": 5, \"totalEvidence\": 307, \"lastScanAt\": \"2026-06-02T14:32:00\", \"lastRunId\": \"a1b2c3d4\", \"database\": \"sqlite\", \"supabaseConfigured\": false } . ",
+    "url": "/output/#get-apistats",
+    
+    "relUrl": "/output/#get-apistats"
+  },"164": {
+    "doc": "Output examples",
+    "title": "GET /api/discover/parkinsons",
+    "content": "Legacy route — disease is currently hardcoded in api_server.py as \"Parkinson's Disease\". Subgroups and connections reflect the live database. { \"disease\": \"Parkinson's Disease\", \"subgroups\": [ { \"subgroupId\": 1, \"name\": \"GBA-mutation PD\", \"definingFeatures\": \"GBA1 variant carriers; reduced GCase activity\", \"evidenceCount\": 2 } ], \"treatmentConnections\": [ { \"connectionId\": 1, \"subgroup\": \"GBA-mutation PD\", \"mechanism\": \"lysosomal dysfunction\", \"treatment\": \"GCase activation\", \"evidenceStrength\": 8.5, \"commercialPotential\": 7.2, \"confidence\": 80.2 } ] } . ",
+    "url": "/output/#get-apidiscoverparkinsons",
+    
+    "relUrl": "/output/#get-apidiscoverparkinsons"
+  },"165": {
+    "doc": "Output examples",
+    "title": "Dashboard panels",
+    "content": "| Panel | Source | . | Step 2 KPI strip | GET /api/stats + runStats from last run (Tab 2 only) | . | Run status strip | Complete / Partial / Running / Failed | . | Step 1 — Configure &amp; run | POST /api/run-discovery | . | Step 2 — Pipeline diagram | Agent trace from GET /api/agents?run_id= | . | Ideal candidate profile cards | synthetic_cohort in run response | . | Ranked treatments | GET /api/recommendations?run_id= | . | Evidence table | GET /api/evidence?offset=&amp;limit= | . | Recent runs | GET /api/runs?limit=5 | . | Step 3 — Grant proposal | GET /api/cua/demo · inlined GET /cua-demo/graded6.html | . See Dashboard for how to run the UI locally. ",
+    "url": "/output/#dashboard-panels",
+    
+    "relUrl": "/output/#dashboard-panels"
+  },"166": {
+    "doc": "Site publishing",
+    "title": "Site publishing",
+    "content": "This documentation site is built with Jekyll and the Just the Docs theme. Target URL: https://neurodiscover.github.io . ",
+    "url": "/pages-setup/",
+    
+    "relUrl": "/pages-setup/"
+  },"167": {
+    "doc": "Site publishing",
+    "title": "Why neurodiscover.github.io",
+    "content": "GitHub Pages serves org/user sites from a repository named neurodiscover.github.io under the neurodiscover GitHub org (or user account). That yields a root URL without /Quorum/ in the path. The application source code stays in kahinimehta/Quorum; docs are deployed to the org Pages repo. ",
+    "url": "/pages-setup/#why-neurodiscovergithubio",
+    
+    "relUrl": "/pages-setup/#why-neurodiscovergithubio"
+  },"168": {
+    "doc": "Site publishing",
+    "title": "One-time setup",
+    "content": ". | Create GitHub org (or user) neurodiscover | Create repository neurodiscover.github.io (public) | In kahinimehta/Quorum → Settings → Secrets → Actions, add: . | NEURODISCOVERY_DOCS — see token options below | . | Enable GitHub Pages on the org repo: Settings → Pages → Source: Deploy from branch → main / root | . Deploy succeeded but site shows 404? Pushing files to neurodiscover.github.io is not enough — you must enable Pages on that repo (step 4). Wait 2–5 minutes, then hard-refresh or try an incognito window. Use https://neurodiscover.github.io (not kahinimehta.github.io/Quorum/). PAT options (if deploy fails with 403) . Option A — Classic token (most reliable for cross-repo push) . | GitHub → Settings → Developer settings → Tokens (classic) → Generate | Scope: repo (full control of private repositories) | Save as secret NEURODISCOVERY_DOCS in Quorum | . Option B — Fine-grained token . | Resource owner: neurodiscover | Repository: neurodiscover.github.io only | Contents: Read and write | Metadata: Read-only (usually auto-included) | . The deploy workflow uses persist-credentials: false on checkout so the PAT is not overridden by the default GITHUB_TOKEN. ",
+    "url": "/pages-setup/#one-time-setup",
+    
+    "relUrl": "/pages-setup/#one-time-setup"
+  },"169": {
+    "doc": "Site publishing",
+    "title": "Deploy workflow",
+    "content": "From Quorum repo: Actions → “Deploy docs to neurodiscover.github.io” → Run workflow . The workflow: . | Checks out docs/ | Runs bundle exec jekyll build (Just the Docs) | Pushes docs/_site/ to neurodiscover/neurodiscover.github.io main branch | . Workflow file: .github/workflows/deploy-neurodiscover-org-pages.yml . ",
+    "url": "/pages-setup/#deploy-workflow",
+    
+    "relUrl": "/pages-setup/#deploy-workflow"
+  },"170": {
+    "doc": "Site publishing",
+    "title": "Preview on Quorum repo (optional)",
+    "content": "Actions → “Deploy documentation to GitHub Pages” builds Jekyll and publishes to this repo’s GitHub Pages environment (project URL, e.g. kahinimehta.github.io/Quorum/). Use for PR previews; the canonical public URL is neurodiscover.github.io. ",
+    "url": "/pages-setup/#preview-on-quorum-repo-optional",
+    
+    "relUrl": "/pages-setup/#preview-on-quorum-repo-optional"
+  },"171": {
+    "doc": "Site publishing",
+    "title": "Site shows 404 after a successful deploy",
+    "content": "| Check | Action | . | Pages enabled? | neurodiscover/neurodiscover.github.io → Settings → Pages → Source: Deploy from a branch → main / / (root) → Save | . | Correct URL? | https://neurodiscover.github.io — not the Quorum project URL | . | Files on main? | Repo should contain index.html, assets/, etc. at the root (not a docs/ subfolder) | . | Still 404? | Wait 2–5 min after enabling Pages; hard-refresh (Cmd+Shift+R) or incognito | . | Custom domain? | Remove any custom domain under Pages unless DNS is configured | . ",
+    "url": "/pages-setup/#site-shows-404-after-a-successful-deploy",
+    
+    "relUrl": "/pages-setup/#site-shows-404-after-a-successful-deploy"
+  },"172": {
+    "doc": "Site publishing",
+    "title": "Build locally",
+    "content": "cd docs bundle install bundle exec jekyll serve . Open http://127.0.0.1:4000 . ",
+    "url": "/pages-setup/#build-locally",
+    
+    "relUrl": "/pages-setup/#build-locally"
+  },"173": {
+    "doc": "Site publishing",
+    "title": "Auto-deploy on push (optional)",
+    "content": "Edit .github/workflows/deploy-neurodiscover-org-pages.yml to add: . on: push: branches: [main] paths: - \"docs/**\" workflow_dispatch: . after NEURODISCOVERY_DOCS is configured. ",
+    "url": "/pages-setup/#auto-deploy-on-push-optional",
+    
+    "relUrl": "/pages-setup/#auto-deploy-on-push-optional"
+  },"174": {
+    "doc": "Patient Subgroup",
+    "title": "Agent 2 — Patient Subgroup",
+    "content": "Module: neurodiscover/agents/patient_subgroup_agent.py Owner: Alia Merchant Step order: 2 . ",
+    "url": "/workflow/patient-subgroup/#agent-2--patient-subgroup",
+    
+    "relUrl": "/workflow/patient-subgroup/#agent-2--patient-subgroup"
+  },"175": {
+    "doc": "Patient Subgroup",
+    "title": "Role",
+    "content": "Read distilled evidence rows and refine patient subgroup definitions — grouping by subgroup name, aggregating mechanisms and treatments, and writing canonical definitions to subgroups. ",
+    "url": "/workflow/patient-subgroup/#role",
+    
+    "relUrl": "/workflow/patient-subgroup/#role"
+  },"176": {
+    "doc": "Patient Subgroup",
+    "title": "Reads",
+    "content": "SELECT evidence_id, subgroup, mechanism, treatment, key_result, study_type, sample_size FROM evidence WHERE subgroup IS NOT NULL; . ",
+    "url": "/workflow/patient-subgroup/#reads",
+    
+    "relUrl": "/workflow/patient-subgroup/#reads"
+  },"177": {
+    "doc": "Patient Subgroup",
+    "title": "Writes",
+    "content": "| Table | Action | . | subgroups | INSERT new names or UPDATE defining_features / notes | . | agent_outputs | Trace with subgroup count and names | . ",
+    "url": "/workflow/patient-subgroup/#writes",
+    
+    "relUrl": "/workflow/patient-subgroup/#writes"
+  },"178": {
+    "doc": "Patient Subgroup",
+    "title": "Logic (summary)",
+    "content": ". | Group evidence rows by subgroup string | Collect distinct mechanisms and treatments per subgroup | Build defining features from aggregated evidence snippets | Emit structured subgroup objects for Agent 3 | . ",
+    "url": "/workflow/patient-subgroup/#logic-summary",
+    
+    "relUrl": "/workflow/patient-subgroup/#logic-summary"
+  },"179": {
+    "doc": "Patient Subgroup",
+    "title": "Seed vocabulary",
+    "content": "Demo seed uses five illustrative subgroup names (exact match enables auto-linking): . | GBA-mutation PD | LRRK2 PD | Alpha-synuclein-high PD | Inflammation-high PD | Rapid motor progressors | . ",
+    "url": "/workflow/patient-subgroup/#seed-vocabulary",
+    
+    "relUrl": "/workflow/patient-subgroup/#seed-vocabulary"
+  },"180": {
+    "doc": "Patient Subgroup",
+    "title": "Rules",
+    "content": ". | Do not duplicate evidence rows — tag in evidence, refine in subgroups | Literature Agent auto-links via subgroup_evidence when names match exactly | . ",
+    "url": "/workflow/patient-subgroup/#rules",
+    
+    "relUrl": "/workflow/patient-subgroup/#rules"
+  },"181": {
+    "doc": "Patient Subgroup",
+    "title": "Example output shape (in-memory)",
+    "content": "{ \"subgroups\": [ { \"name\": \"GBA-mutation PD\", \"defining_features\": \"GBA1 variant carriers; reduced GCase activity\", \"mechanisms\": [\"lysosomal dysfunction\"], \"treatments\": [\"GCase activation\"], \"evidence_count\": 2 } ] } . ",
+    "url": "/workflow/patient-subgroup/#example-output-shape-in-memory",
+    
+    "relUrl": "/workflow/patient-subgroup/#example-output-shape-in-memory"
+  },"182": {
+    "doc": "Patient Subgroup",
+    "title": "Patient Subgroup",
+    "content": " ",
+    "url": "/workflow/patient-subgroup/",
+    
+    "relUrl": "/workflow/patient-subgroup/"
+  },"183": {
+    "doc": "Person 2 backend",
+    "title": "Person 2 — Backend API on Supabase",
+    "content": "Quick handoff for the dashboard API (neurodiscover/api_server.py, FastAPI). ",
+    "url": "/developer-reference/person2-backend/#person-2--backend-api-on-supabase",
+    
+    "relUrl": "/developer-reference/person2-backend/#person-2--backend-api-on-supabase"
+  },"184": {
+    "doc": "Person 2 backend",
+    "title": "Connection",
+    "content": "# .env (not in git) SUPABASE_DATABASE_URL=postgresql://... ",
+    "url": "/developer-reference/person2-backend/#connection",
+    
+    "relUrl": "/developer-reference/person2-backend/#connection"
+  },"185": {
+    "doc": "Person 2 backend",
+    "title": "Tables (not MongoDB papers)",
+    "content": "| API concept | SQL table | . | Papers / sources | evidence | . | Subgroups | subgroups | . | Opportunities | treatment_connections | . | Agent trace | agent_outputs | . | Final ranking | recommendations | . Full column list: Database schema. ",
+    "url": "/developer-reference/person2-backend/#tables-not-mongodb-papers",
+    
+    "relUrl": "/developer-reference/person2-backend/#tables-not-mongodb-papers"
+  },"186": {
+    "doc": "Person 2 backend",
+    "title": "Endpoints → SQL",
+    "content": "Copy from Backend queries and queries.sql. Example discover payload shape: . { \"disease\": \"Configured indication (from seed or pull)\", \"subgroups\": [], \"treatmentConnections\": [], \"recommendation\": {} } . ",
+    "url": "/developer-reference/person2-backend/#endpoints--sql",
+    
+    "relUrl": "/developer-reference/person2-backend/#endpoints--sql"
+  },"187": {
+    "doc": "Person 2 backend",
+    "title": "Pydantic models",
+    "content": "neurodiscover/models/schemas.py is for API JSON only. Map fields to SQL columns (e.g. defining_features in DB vs description in Pydantic) in your route handlers. ",
+    "url": "/developer-reference/person2-backend/#pydantic-models",
+    
+    "relUrl": "/developer-reference/person2-backend/#pydantic-models"
+  },"188": {
+    "doc": "Person 2 backend",
+    "title": "Setup steps",
+    "content": ". | Local / no keys: omit SUPABASE_DATABASE_URL, run python3 cli.py build, then python3 api_server.py. | Team Supabase: get SUPABASE_DATABASE_URL from Person 3 — do not run build on shared DB. | Confirm tables: python3 cli.py validate. | Routes in neurodiscover/api_server.py — see Backend queries and API endpoints. | . ",
+    "url": "/developer-reference/person2-backend/#setup-steps",
+    
+    "relUrl": "/developer-reference/person2-backend/#setup-steps"
+  },"189": {
+    "doc": "Person 2 backend",
+    "title": "Quick verify",
+    "content": "cd neurodiscover python3 api_server.py curl -s http://127.0.0.1:5000/api/stats curl -s -X POST http://127.0.0.1:5000/api/run-discovery \\ -H 'Content-Type: application/json' -d '{\"mode\":\"demo\",\"max_papers\":10}' . Dashboard: ../../neurodiscover/frontend/quickstart.md. Architecture: Dashboard API. See Supabase for project creation and schema apply. ",
+    "url": "/developer-reference/person2-backend/#quick-verify",
+    
+    "relUrl": "/developer-reference/person2-backend/#quick-verify"
+  },"190": {
+    "doc": "Person 2 backend",
+    "title": "Person 2 backend",
+    "content": " ",
+    "url": "/developer-reference/person2-backend/",
+    
+    "relUrl": "/developer-reference/person2-backend/"
+  },"191": {
+    "doc": "Problem & significance",
+    "title": "Problem &amp; significance",
+    "content": "Track 02 — Autonomous Research: literature synthesis, hypothesis generation, and evidence tracking. ",
+    "url": "/problem/#problem--significance",
+    
+    "relUrl": "/problem/#problem--significance"
+  },"192": {
+    "doc": "Problem & significance",
+    "title": "The gap (Pfizer Commercial Development Discovery)",
+    "content": "Current commercial development can only evaluate a handful of opportunities over months. Investments rely on static, point-in-time expert review at high cost. The opportunities that most change patient care are often the ones the existing taxonomy is least equipped to find: . | Hidden signal | Why experts miss it | . | Subgroup inside a heterogeneous indication | Portfolio tools aggregate at indication level | . | Cross-condition mechanism links | Siloed therapeutic-area review | . | Emerging evidence after the last review cycle | Manual synthesis does not scale with publication velocity | . Expert review surfaces what experts already know to look for. NeuroDiscover tests whether an AI-native, continuously updating pipeline reveals structurally hidden connections. ",
+    "url": "/problem/#the-gap-pfizer-commercial-development-discovery",
+    
+    "relUrl": "/problem/#the-gap-pfizer-commercial-development-discovery"
+  },"193": {
+    "doc": "Problem & significance",
+    "title": "Our approach",
+    "content": "NeuroDiscover deploys six sequential agents on a shared evidence database: . | Ingest — literature, trials, grants (BioMCP, RePORTER, optional web search) | Subgroup — distill patient segments from evidence | Connect — map subgroup → mechanism → treatment | Score evidence — skeptic agent down-weights weak sources | Score commercial potential — market and funding signals | Recommend — ranked Prioritize / Monitor / Reject with rationale | . Conclusions update as new rows land in evidence — compressing background research from months toward hours/days for a configured query. ",
+    "url": "/problem/#our-approach",
+    
+    "relUrl": "/problem/#our-approach"
+  },"194": {
+    "doc": "Problem & significance",
+    "title": "Scientific &amp; commercial significance",
+    "content": ". | Discovery efficiency — Reduce time and cost to identify and triage opportunities | Portfolio ROI — Surface ranked connections before expensive expert panels | Auditability — Every recommendation traces to source_id rows judges can verify | Generalizable — Same pipeline for any BioMCP-supported disease via --disease / API query | . Demo note: The hackathon dashboard ships with seed subgroup labels and demo source ids (DEMO-*) for offline judging. Live runs use real PMIDs/NCT ids from PubMed and ClinicalTrials.gov. ",
+    "url": "/problem/#scientific--commercial-significance",
+    
+    "relUrl": "/problem/#scientific--commercial-significance"
+  },"195": {
+    "doc": "Problem & significance",
+    "title": "Alignment with agentic science literature",
+    "content": "Our design follows patterns surveyed in recent work on agentic scientific discovery: . | Unified literature + trial retrieval (cf. unified PubMed / trials access) | Structured extraction into a distilled schema (not raw JSON blobs) | Incremental scan — skip re-extraction for known sources | Append-only agent trace (agent_outputs) for reproducibility | . Relevant literature . | Ghareeb, A. E., Chang, B., Mitchener, L., Yiu, A., Szostkiewicz, C. J., Shved, D., Gyimesi, G. J., Laurent, J. M., Wright, S. M., Razzak, M. T., White, A. D., Finnemann, S. C., Hinks, M. M., &amp; Rodriques, S. G. (2026). A multi-agent system for automating scientific discovery. Nature, 1–3. https://doi.org/10.1038/s41586-026-10652-y . | Hartung, T. AI, agentic models and lab automation for scientific discovery — the beginning of scAInce. Frontiers in AI. https://doi.org/10.3389/frai.2025.1649155 . | Wei, J., Yang, Y., Zhang, X., Chen, Y., Zhuang, X., Gao, Z., Zhou, D., Wang, G., Gao, Z., Cao, J., Qiu, Z., Hu, M., Ma, C., Tang, S., He, J., Song, C., He, X., Zhang, Q., You, C., … Zhou, B. (2025). From AI for Science to Agentic Science: A survey on autonomous scientific discovery. arXiv. https://doi.org/10.48550/arXiv.2508.14111 . | . ",
+    "url": "/problem/#alignment-with-agentic-science-literature",
+    
+    "relUrl": "/problem/#alignment-with-agentic-science-literature"
+  },"196": {
+    "doc": "Problem & significance",
+    "title": "Related docs",
+    "content": ". | Workflow — per-agent detail | Output examples — JSON and dashboard panels | . ",
+    "url": "/problem/#related-docs",
+    
+    "relUrl": "/problem/#related-docs"
+  },"197": {
+    "doc": "Problem & significance",
+    "title": "Problem & significance",
+    "content": " ",
+    "url": "/problem/",
+    
+    "relUrl": "/problem/"
+  },"198": {
+    "doc": "Downstream agents",
+    "title": "Downstream agents (integrated)",
+    "content": "Agents 2–6 run in-process via neurodiscover/orchestrator.py after literature synthesis (Agent 1). | Agent | Module | . | Patient Subgroup | agents/patient_subgroup_agent.py | . | Treatment Connection | agents/treatment_connection_agent.py | . | Evidence Scoring | agents/evidence_scoring_agent.py | . | Commercial Discovery | agents/commercial_discovery_agent.py | . | Conclusion Update (dashboard) | scores → recommendations in orchestrator | . | Conclusion Update (CUA) | cua/ — read-only; local proposal artifacts; Step 3 Grant Proposal tab | . ",
+    "url": "/developer-reference/remaining-agents/#downstream-agents-integrated",
+    
+    "relUrl": "/developer-reference/remaining-agents/#downstream-agents-integrated"
+  },"199": {
+    "doc": "Downstream agents",
+    "title": "Input",
+    "content": "Evidence rows from the evidence table (subgroup, mechanism, treatment, source_id, title, etc.). ",
+    "url": "/developer-reference/remaining-agents/#input",
+    
+    "relUrl": "/developer-reference/remaining-agents/#input"
+  },"200": {
+    "doc": "Downstream agents",
+    "title": "Output",
+    "content": ". | subgroups, treatment_connections, connection_evidence | evidence_strength, commercial_potential on connections | recommendations with Prioritize / Monitor / Reject tiers | agent_outputs trace rows per run | . ",
+    "url": "/developer-reference/remaining-agents/#output",
+    
+    "relUrl": "/developer-reference/remaining-agents/#output"
+  },"201": {
+    "doc": "Downstream agents",
+    "title": "Scoring",
+    "content": "confidence = evidence_strength × 0.55 + commercial_potential × 0.45 . See Agent I/O and Dashboard API. ",
+    "url": "/developer-reference/remaining-agents/#scoring",
+    
+    "relUrl": "/developer-reference/remaining-agents/#scoring"
+  },"202": {
+    "doc": "Downstream agents",
+    "title": "CUA — NIH grant proposal (Agent 6)",
+    "content": "The cua/ package is not wired into orchestrator.py. After agents 1–5 (or a full pipeline run) have populated the blackboard, run CUA manually: . cd cua &amp;&amp; pip install -e . export CUA_LIVE=1 ANTHROPIC_API_KEY=... python -m cua.nih.run_db --db \"$SUPABASE_DATABASE_URL\" --run-id &lt;id&gt; --capture-content . Outputs land under cua/outputs/ (proposal, trace, audit, ingestion). No recommendations or agent_outputs writes. Full detail: Conclusion Update workflow and cua/README.md. ",
+    "url": "/developer-reference/remaining-agents/#cua--nih-grant-proposal-agent-6",
+    
+    "relUrl": "/developer-reference/remaining-agents/#cua--nih-grant-proposal-agent-6"
+  },"203": {
+    "doc": "Downstream agents",
+    "title": "Downstream agents",
+    "content": " ",
+    "url": "/developer-reference/remaining-agents/",
+    
+    "relUrl": "/developer-reference/remaining-agents/"
+  },"204": {
+    "doc": "Supabase",
+    "title": "Supabase setup — shared live database (free tier)",
+    "content": "Use this when the team needs one database that updates from multiple laptops until and during the hackathon. Person 2 (backend) connects with the same SUPABASE_DATABASE_URL (Node pg, Python psycopg). Person 5 (Next.js) uses the Framework tab keys (NEXT_PUBLIC_SUPABASE_*) — not this Postgres URI. ",
+    "url": "/developer-reference/supabase/#supabase-setup--shared-live-database-free-tier",
+    
+    "relUrl": "/developer-reference/supabase/#supabase-setup--shared-live-database-free-tier"
+  },"205": {
+    "doc": "Supabase",
+    "title": "1. Create project (free)",
+    "content": ". | Sign up at supabase.com → New project. | Save the database password. | Connect → Direct → Connection string (in the UI). | Under Connection method, choose Session pooler (not Direct, not Transaction pooler). | . | Method | Use for NeuroDiscover? | . | Session pooler (port 5432, aws-*-*.pooler.supabase.com) | Yes — IPv4-friendly on free tier | . | Transaction pooler (port 6543) | No if UI says IPv6-only without paid add-on | . | Direct (db.*.supabase.co) | No on IPv4-only networks without paid IPv4 add-on | . Example shape (your region/ref will differ): . postgresql://postgres.brfjrctbzuwcpkdnaagf:[YOUR-PASSWORD]@aws-1-us-west-2.pooler.supabase.com:5432/postgres . | User must be postgres.&lt;project-ref&gt; (not postgres alone). | Host must be *.pooler.supabase.com (not db.*.supabase.co). | URL-encode special characters in the password (@ → %40, etc.). | . Share the URI via Discord / 1Password — never commit .env. ",
+    "url": "/developer-reference/supabase/#1-create-project-free",
+    
+    "relUrl": "/developer-reference/supabase/#1-create-project-free"
+  },"206": {
+    "doc": "Supabase",
+    "title": "2. Apply schema (once)",
+    "content": "Option A — SQL Editor . | Supabase dashboard → SQL Editor → New query. | Paste neurodiscover/schema.pg.sql → Run. | . Option B — CLI . cd neurodiscover cp .env.example .env # paste Session pooler SUPABASE_DATABASE_URL pip install -r requirements.txt python3 cli.py init-supabase python3 cli.py build python3 cli.py validate . ",
+    "url": "/developer-reference/supabase/#2-apply-schema-once",
+    
+    "relUrl": "/developer-reference/supabase/#2-apply-schema-once"
+  },"207": {
+    "doc": "Supabase",
+    "title": "3. Team .env",
+    "content": "# Python agents + cli.py + Person 2 backend SUPABASE_DATABASE_URL=postgresql://postgres.&lt;ref&gt;:&lt;password&gt;@aws-1-&lt;region&gt;.pooler.supabase.com:5432/postgres # Next.js dashboard only (Framework tab / API Keys) NEXT_PUBLIC_SUPABASE_URL=https://&lt;ref&gt;.supabase.co NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=... Unset SUPABASE_DATABASE_URL to use local neurodiscover.db offline. ",
+    "url": "/developer-reference/supabase/#3-team-env",
+    
+    "relUrl": "/developer-reference/supabase/#3-team-env"
+  },"208": {
+    "doc": "Supabase",
+    "title": "4. Day-to-day commands",
+    "content": "cd neurodiscover python3 cli.py scan --max 5 python3 cli.py pull --max 10 python3 cli.py show evidence python3 cli.py validate make dashboard # agents-only on Supabase: connections + recommendations on startup . Initial real evidence is loaded by the data engineer before demo; use scan for incremental updates. make dashboard with SUPABASE_DATABASE_URL set runs agents-only (agents 2–6 on all existing rows) — no build, no literature re-pull. ",
+    "url": "/developer-reference/supabase/#4-day-to-day-commands",
+    
+    "relUrl": "/developer-reference/supabase/#4-day-to-day-commands"
+  },"209": {
+    "doc": "Supabase",
+    "title": "5. Person 2 — backend connection",
+    "content": "import pg from 'pg'; const pool = new pg.Pool({ connectionString: process.env.SUPABASE_DATABASE_URL, ssl: { rejectUnauthorized: false }, }); . import psycopg from psycopg.rows import dict_row conn = psycopg.connect(os.environ[\"SUPABASE_DATABASE_URL\"], row_factory=dict_row) . See queries.sql and Backend queries. Table is evidence, not papers. ",
+    "url": "/developer-reference/supabase/#5-person-2--backend-connection",
+    
+    "relUrl": "/developer-reference/supabase/#5-person-2--backend-connection"
+  },"210": {
+    "doc": "Supabase",
+    "title": "6. What to ignore in the Supabase UI",
+    "content": "| UI item | For NeuroDiscover | . | MCP / “Connect your agent” / Copy prompt | Optional Cursor tooling only — not agents/literature_agent.py | . | npx skills add supabase/agent-skills | Optional — not required for the pipeline | . | Enable IPv4 add-on | Not needed if you use Session pooler | . ",
+    "url": "/developer-reference/supabase/#6-what-to-ignore-in-the-supabase-ui",
+    
+    "relUrl": "/developer-reference/supabase/#6-what-to-ignore-in-the-supabase-ui"
+  },"211": {
+    "doc": "Supabase",
+    "title": "7. Free tier notes",
+    "content": ". | Project may pause after inactivity — open the dashboard before demo day. | cli.py build truncates all tables on Supabase — coordinate with the team; use pull/scan on a live DB. | . ",
+    "url": "/developer-reference/supabase/#7-free-tier-notes",
+    
+    "relUrl": "/developer-reference/supabase/#7-free-tier-notes"
+  },"212": {
+    "doc": "Supabase",
+    "title": "Supabase",
+    "content": " ",
+    "url": "/developer-reference/supabase/",
+    
+    "relUrl": "/developer-reference/supabase/"
+  },"213": {
+    "doc": "Team env sharing",
+    "title": "Sharing credentials with the team",
+    "content": "Never commit .env, personal/team-keys-for-sharing.txt, or database passwords to GitHub. ",
+    "url": "/developer-reference/team-env-sharing/#sharing-credentials-with-the-team",
+    
+    "relUrl": "/developer-reference/team-env-sharing/#sharing-credentials-with-the-team"
+  },"214": {
+    "doc": "Team env sharing",
+    "title": "Your local checklist",
+    "content": ". | Fill ../../neurodiscover/.env (copy from .env.example). | Regenerate the share file: python3 scripts/export_team_keys.py . | Open personal/team-keys-for-sharing.txt (gitignored) and copy the right section to each teammate. | . ",
+    "url": "/developer-reference/team-env-sharing/#your-local-checklist",
+    
+    "relUrl": "/developer-reference/team-env-sharing/#your-local-checklist"
+  },"215": {
+    "doc": "Team env sharing",
+    "title": "Who gets which keys",
+    "content": "| Teammate | Share | . | Everyone (agents + backend) | SUPABASE_DATABASE_URL | . | Person 2 (API) | SUPABASE_DATABASE_URL only | . | Person 4 (agents 2–6) | SUPABASE_DATABASE_URL | . | Person 5 (Next.js UI) | NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY | . | You (literature pull) | Keep NEBIUS_* yourself or share if others run cli.py pull | . | Optional (server routes) | SUPABASE_SERVICE_ROLE_KEY from Supabase → Settings → API | . ",
+    "url": "/developer-reference/team-env-sharing/#who-gets-which-keys",
+    
+    "relUrl": "/developer-reference/team-env-sharing/#who-gets-which-keys"
+  },"216": {
+    "doc": "Team env sharing",
+    "title": "Where to find missing keys",
+    "content": "| Variable | Location | . | SUPABASE_DATABASE_URL | Supabase → Project Settings → Database → Connection string → URI | . | NEXT_PUBLIC_SUPABASE_URL | https://YOUR_REF.supabase.co | . | NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY | Supabase → Settings → API → publishable key | . | SUPABASE_SERVICE_ROLE_KEY | Supabase → Settings → API → service_role (secret) | . | NEBIUS_* | Nebius AI Studio dashboard | . ",
+    "url": "/developer-reference/team-env-sharing/#where-to-find-missing-keys",
+    
+    "relUrl": "/developer-reference/team-env-sharing/#where-to-find-missing-keys"
+  },"217": {
+    "doc": "Team env sharing",
+    "title": "After sharing",
+    "content": "Tell teammates: . cd neurodiscover # or Quorum/neurodiscover cp .env.example .env # paste keys you sent pip install -r requirements.txt python3 cli.py validate python3 cli.py show . See also Supabase and Person 2 backend. ",
+    "url": "/developer-reference/team-env-sharing/#after-sharing",
+    
+    "relUrl": "/developer-reference/team-env-sharing/#after-sharing"
+  },"218": {
+    "doc": "Team env sharing",
+    "title": "Team env sharing",
+    "content": " ",
+    "url": "/developer-reference/team-env-sharing/",
+    
+    "relUrl": "/developer-reference/team-env-sharing/"
+  },"219": {
+    "doc": "Team",
+    "title": "Team",
+    "content": "Quorum · NeuroDiscover AI · NextGen BioAgents Hackathon · Final Showcase June 6, 2026 . ",
+    "url": "/team/",
+    
+    "relUrl": "/team/"
+  },"220": {
+    "doc": "Team",
+    "title": "Collaboration at a glance",
+    "content": "| Member | Domain | Project contribution | . | Alia Merchant | Strategy · commercialization | Product framing, downstream agents (2–5), scoring, market analysis, demo preparation | . | Amy He | ML · agent infrastructure | Agent design patterns, orchestrator conclusion logic, commercial signals, CUA (6) | . | Ayelet Peres | Computational biology · data | Literature Agent (1), ingestion, schema, Supabase, validation | . | Kahini Mehta | Biology · engineering · design | Schema, orchestrator, API, dashboard (Steps 1–3), docs site, integration, demo preparation | . | William Yakah | Design · biology | Demo narrative, cross-agent usability, dashboard design, grant appropriateness | . Interdisciplinary mix: life sciences + ML + strategy + full-stack engineering — each role maps to a distinct agent or platform layer in the shipped system. ",
+    "url": "/team/#collaboration-at-a-glance",
+    
+    "relUrl": "/team/#collaboration-at-a-glance"
+  },"221": {
+    "doc": "Team",
+    "title": "Alia Merchant",
+    "content": "Strategy · commercialization . Healthcare and life sciences strategist with an MBA and MSIT. Brings a business and venture lens (Harvard BioVenture, Nucleate finalist, Enventure first-place winner) and HSIL Hackathon 2026 experience. The team’s commercialization and strategy voice. On this project: Product framing, downstream agents (2–5), evidence and commercial scoring, market analysis, and demo preparation. ",
+    "url": "/team/#alia-merchant",
+    
+    "relUrl": "/team/#alia-merchant"
+  },"222": {
+    "doc": "Team",
+    "title": "Amy He",
+    "content": "ML · agent infrastructure . Research scientist at Topos Bio (SF) working on foundation model development and application in drug discovery, with a background in AI/ML and biochemistry. Heavy daily user of Codex and Claude Code, focused on agent infrastructure for observability and semantic layer engineering. On this project: Agent design patterns, orchestrator conclusion logic, commercial signals, and CUA (Agent 6) — the NIH grant-proposal package (cua/) behind dashboard Step 3. ",
+    "url": "/team/#amy-he",
+    
+    "relUrl": "/team/#amy-he"
+  },"223": {
+    "doc": "Team",
+    "title": "Ayelet Peres",
+    "content": "Computational biology · data . Postdoc at Yale School of Medicine in computational immunology, immunogenomics, and AI. Works on immune receptor genomics, large-scale biological datasets, and tools that make complex data easier to analyze. On this project: Literature Agent (1), PubMed/trials ingestion, shared schema, Supabase, and validation. ",
+    "url": "/team/#ayelet-peres",
+    
+    "relUrl": "/team/#ayelet-peres"
+  },"224": {
+    "doc": "Team",
+    "title": "Kahini Mehta",
+    "content": "Biology · engineering · design . Third-year PhD student in Columbia’s Neurobiology and Behavior program working with human single-neuron and MRI data. Focus on analysis pipelines and computational modeling using Bayesian and machine learning methods. Passionate about open science and reproducibility. On this project: Schema, orchestrator, API, dashboard (Steps 1–3), docs site, integration, and demo preparation. ",
+    "url": "/team/#kahini-mehta",
+    
+    "relUrl": "/team/#kahini-mehta"
+  },"225": {
+    "doc": "Team",
+    "title": "William Yakah",
+    "content": "Design · biology . Fifth-year PhD student in Nutritional and Metabolic Biology studying maternal-to-fetal cholesterol transport and fetal neurodevelopment. Co-founder of LabShare, a platform connecting researchers to institutional resources (live at Columbia and elsewhere). On this project: Demo narrative, cross-agent usability, dashboard design, and grant appropriateness. ",
+    "url": "/team/#william-yakah",
+    
+    "relUrl": "/team/#william-yakah"
+  },"226": {
+    "doc": "Team",
+    "title": "How we worked together",
+    "content": "flowchart TB subgraph ingest [Data layer] Ayelet[Ayelet · literature + schema] DB[(Evidence DB)] Ayelet --&gt; DB end subgraph agents [Agent logic] Alia[Alia · agents 2–5 + scoring] Amy[Amy · orchestrator + CUA] Alia --&gt; DB Amy --&gt; DB end subgraph platform [Platform] Kahini[Kahini · API + dashboard + docs] William[William · demo + dashboard UX] William --&gt; Kahini Kahini --&gt; DB end DB --&gt; Out[Dashboard + docs site] . | Schema-first: schema.sql + developer-reference/agent-io.md before agent code diverged | Shared run_id: every agent appends to agent_outputs for audit | Safe demo path: offline seed + synthetic cohort agreed early for showcase reliability | Dual Agent 6: orchestrator formula rankings in the pipeline; cua/ NIH proposal on dashboard Step 3 — Grant Proposal (static graded6 demo — expanded proposal · collapsed Grant pipeline + Pipeline trace &amp; audit). Step 2 KPI strip + agent trace under collapsed Audit &amp; provenance. | . ",
+    "url": "/team/#how-we-worked-together",
+    
+    "relUrl": "/team/#how-we-worked-together"
+  },"227": {
+    "doc": "Treatment Connection",
+    "title": "Agent 3 — Treatment Connection",
+    "content": "Module: neurodiscover/agents/treatment_connection_agent.py Owner: Alia Merchant Step order: 3 (orchestrator logs trace) . ",
+    "url": "/workflow/treatment-connection/#agent-3--treatment-connection",
+    
+    "relUrl": "/workflow/treatment-connection/#agent-3--treatment-connection"
+  },"228": {
+    "doc": "Treatment Connection",
+    "title": "Role",
+    "content": "Map subgroup → mechanism → treatment triples from in-memory evidence rows and return deduplicated connections with supporting source_id lists. ",
+    "url": "/workflow/treatment-connection/#role",
+    
+    "relUrl": "/workflow/treatment-connection/#role"
+  },"229": {
+    "doc": "Treatment Connection",
+    "title": "Reads",
+    "content": "In-memory evidence rows (from orchestrator) with subgroup, mechanism, and treatment populated — not a live SQL join at agent runtime. ",
+    "url": "/workflow/treatment-connection/#reads",
+    
+    "relUrl": "/workflow/treatment-connection/#reads"
+  },"230": {
+    "doc": "Treatment Connection",
+    "title": "Writes (via orchestrator)",
+    "content": "INSERT INTO treatment_connections (subgroup_id, mechanism, treatment) VALUES (?,?,?); INSERT OR IGNORE INTO connection_evidence (connection_id, evidence_id) VALUES (?,?); . The orchestrator resolves subgroup name → subgroup_id, upserts connections, and links evidence_sources to connection_evidence. ",
+    "url": "/workflow/treatment-connection/#writes-via-orchestrator",
+    
+    "relUrl": "/workflow/treatment-connection/#writes-via-orchestrator"
+  },"231": {
+    "doc": "Treatment Connection",
+    "title": "Logic (summary)",
+    "content": ". | Group evidence by (subgroup, mechanism, treatment) | Count supporting rows and collect source_ids | Return connection objects for orchestrator persistence | . ",
+    "url": "/workflow/treatment-connection/#logic-summary",
+    
+    "relUrl": "/workflow/treatment-connection/#logic-summary"
+  },"232": {
+    "doc": "Treatment Connection",
+    "title": "Example connection",
+    "content": "| Field | Value | . | subgroup | GBA-mutation PD (demo seed name) | . | mechanism | lysosomal dysfunction | . | treatment | GCase activation | . | supporting sources | DEMO-PMID-001, DEMO-NCT-001 | . Rapid motor progressors use the slug combination strategy, displayed as Combination neuroprotection on the dashboard — a multi-agent neuroprotection stack for fast UPDRS trajectories (see Output — treatment labels). ",
+    "url": "/workflow/treatment-connection/#example-connection",
+    
+    "relUrl": "/workflow/treatment-connection/#example-connection"
+  },"233": {
+    "doc": "Treatment Connection",
+    "title": "Output shape (in-memory)",
+    "content": "{ \"connections\": [ { \"subgroup\": \"GBA-mutation PD\", \"mechanism\": \"lysosomal dysfunction\", \"treatment\": \"GCase activation\", \"evidence_sources\": [\"DEMO-PMID-001\", \"DEMO-NCT-001\"], \"evidence_count\": 2 } ] } . Scores (evidence_strength, commercial_potential) are null until Agents 4 and 5 run. ",
+    "url": "/workflow/treatment-connection/#output-shape-in-memory",
+    
+    "relUrl": "/workflow/treatment-connection/#output-shape-in-memory"
+  },"234": {
+    "doc": "Treatment Connection",
+    "title": "Treatment Connection",
+    "content": " ",
+    "url": "/workflow/treatment-connection/",
+    
+    "relUrl": "/workflow/treatment-connection/"
+  },"235": {
+    "doc": "Validation",
+    "title": "Evidence extraction validation",
+    "content": "After cli.py pull, the literature agent can run automated QA on LLM/Ollama extractions. ",
+    "url": "/developer-reference/validation/#evidence-extraction-validation",
+    
+    "relUrl": "/developer-reference/validation/#evidence-extraction-validation"
+  },"236": {
+    "doc": "Validation",
+    "title": "Commands",
+    "content": "# Pull with default QA (consistency + PubTator sample n=50) python3 cli.py pull --max 20 # Pull without PubTator (faster) python3 cli.py pull --max 20 --no-pubtator # Drop rows that fail consistency checks python3 cli.py pull --max 20 --strict-pull # Audit entire evidence table python3 cli.py validate-extraction # PubTator grounding on existing DB python3 cli.py validate-pubtator --sample 50 # Manual spot-check python3 cli.py spot-check --count 15 # Edit spot_check_results.csv, then: python3 cli.py spot-check --score . ",
+    "url": "/developer-reference/validation/#commands",
+    
+    "relUrl": "/developer-reference/validation/#commands"
+  },"237": {
+    "doc": "Validation",
+    "title": "Consistency checks (validation/consistency.py)",
+    "content": "Validates per row: . | source_id format (numeric PMID, NCT*, grant id) | study_type in allowed set (RCT, cohort, preclinical, Phase 1–3, review, unknown, …) | sample_size if set: integer in (0, 1_000_000) | Literature/trial: mechanism (≥5 chars), treatment (≥3), key_result, evidence_snippet | . Failed rows are kept by default; use --strict-pull to skip insert. ",
+    "url": "/developer-reference/validation/#consistency-checks-validationconsistencypy",
+    
+    "relUrl": "/developer-reference/validation/#consistency-checks-validationconsistencypy"
+  },"238": {
+    "doc": "Validation",
+    "title": "PubTator grounding (validation/pubtator.py)",
+    "content": "Queries PubTator3 for genes, diseases, chemicals and compares to tokens extracted from LLM fields. | Overlap | Label | . | &gt; 0.7 | HIGH | . | 0.3 – 0.7 | MEDIUM | . | &lt; 0.3 | LOW | . Heuristic entity extraction is imperfect; use spot-check for final precision. ",
+    "url": "/developer-reference/validation/#pubtator-grounding-validationpubtatorpy",
+    
+    "relUrl": "/developer-reference/validation/#pubtator-grounding-validationpubtatorpy"
+  },"239": {
+    "doc": "Validation",
+    "title": "Spot-check workflow",
+    "content": ". | spot-check prints abstracts (via BioMCP) and writes spot_check_results.csv. | Read each abstract; fill correct_* columns (or set precision 0.0–1.0 per row). | spot-check --score reports average precision. | . ",
+    "url": "/developer-reference/validation/#spot-check-workflow",
+    
+    "relUrl": "/developer-reference/validation/#spot-check-workflow"
+  },"240": {
+    "doc": "Validation",
+    "title": "Demo readiness (rule of thumb)",
+    "content": "| Metric | Target | . | Consistency pass rate | ≥ 70% | . | PubTator avg overlap (n≥30) | ≥ 0.5 (HIGH/MEDIUM) | . | Manual spot-check (n=15) | ≥ 80% precision | . Validation summary is stored in agent_outputs.payload for the pull run_id (step 3). ",
+    "url": "/developer-reference/validation/#demo-readiness-rule-of-thumb",
+    
+    "relUrl": "/developer-reference/validation/#demo-readiness-rule-of-thumb"
+  },"241": {
+    "doc": "Validation",
+    "title": "Design choices",
+    "content": ". | Flag, don’t delete by default — downstream agents can still use metadata-only rows. | PubTator runs on literature PMIDs only (not trials/grants). | No schema change — confidence lives in reports and CSV, not a new DB column. | . ",
+    "url": "/developer-reference/validation/#design-choices",
+    
+    "relUrl": "/developer-reference/validation/#design-choices"
+  },"242": {
+    "doc": "Validation",
+    "title": "Validation",
+    "content": " ",
+    "url": "/developer-reference/validation/",
+    
+    "relUrl": "/developer-reference/validation/"
+  }
+}
